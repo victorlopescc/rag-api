@@ -1,0 +1,6 @@
+# Dependências apenas para testes e CI.
+-r requirements.txt
+
+pytest
+pytest-asyncio
+pytest-cov

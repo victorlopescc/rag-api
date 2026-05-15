@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env / secrets
+.env
+infra/.env
+*.env.local
+
+# IDE / tooling
+.idea/
+.vscode/
+.claude/
+
+# RAG data
+backend/chroma_data/
+
+# Test / coverage artifacts
+.coverage
+coverage.xml
+.pytest_cache/
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

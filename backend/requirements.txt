@@ -1,0 +1,31 @@
+# API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Banco de dados
+psycopg2-binary
+sqlalchemy
+
+# Extração de texto
+pymupdf
+python-docx
+
+# RAG / Embeddings
+chromadb
+# Reranker cross-encoder. Reordena os top-K do retrieval por relevância
+# semântica fina. Roda 100% local em CPU.
+sentence-transformers
+# Retrieval híbrido (lexical/BM25 + denso). Pega match literal de
+# nomes/siglas que o embedding semântico às vezes solta.
+rank-bm25
+
+# HTTP client (para chamar Ollama)
+httpx
+
+# Mongo (para ler ACKs da Evolution API e resolver LID → phone)
+pymongo
+
+# Utilitários
+pydantic
+pydantic-settings
