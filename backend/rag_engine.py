@@ -2,19 +2,15 @@
 RAG Engine — orquestra a busca semântica e a geração da resposta.
 
 Fluxo:
-  pergunta → estratégia de recuperação → filtra por score
+  pergunta → retrieve híbrido (denso + BM25 + RRF) → filtra por score
            → monta prompt → LLM → resposta
-
-A estratégia é escolhida por quem chama (ver
-``pipeline.retrieval_strategies``). Por padrão é ``default``, que
-replica o comportamento anterior.
 """
 
 import logging
 import time
 from dataclasses import dataclass
 
-from pipeline.retrieval_strategies import Strategy, retrieve
+from pipeline.retrieval import retrieve
 from pipeline.prompt_builder import build_prompt, FALLBACK_MESSAGE
 from pipeline.llm import generate
 from config import settings
@@ -32,13 +28,11 @@ class RAGResponse:
     # que o analytics consiga atribuir uso por documento.
     chunks_used: list[dict]
     latency_ms:  int
-    strategy:    Strategy = "default"
 
 
 def ask(
     question: str,
     category: str | None = None,
-    strategy: Strategy = "default",
     prior_question: str | None = None,
 ) -> RAGResponse:
     """
@@ -46,9 +40,7 @@ def ask(
 
     Parâmetros:
         question: pergunta do usuário
-        category: filtra a busca por categoria de documento (opcional;
-                  ignorado pela estratégia ``widen_k``)
-        strategy: ``default`` | ``query_rewrite`` | ``widen_k``
+        category: filtra a busca por categoria de documento (opcional)
         prior_question: pergunta anterior na MESMA sessão (mantém o tópico
                   no retrieval; o prompt do LLM continua vendo só ``question``).
                   Útil pra "Quanto tempo eu tenho pra prova?" depois de
@@ -63,10 +55,10 @@ def ask(
         f"{prior_question}\n{question}" if prior_question else question
     )
     logger.info(
-        f"RAG (strategy={strategy}): '{question[:60]}...' "
+        f"RAG: '{question[:60]}...' "
         f"(prior_q={'sim' if prior_question else 'não'})"
     )
-    chunks = retrieve(retrieve_question, category=category, strategy=strategy)
+    chunks = retrieve(retrieve_question, category=category)
 
     logger.info(f"{len(chunks)} chunks recuperados.")
 
@@ -98,7 +90,6 @@ def ask(
             was_fallback=True,
             chunks_used=[],
             latency_ms=int((time.time() - start) * 1000),
-            strategy=strategy,
         )
 
     # Monta o prompt com os chunks relevantes
@@ -112,7 +103,7 @@ def ask(
     was_fallback = FALLBACK_MESSAGE.lower() in answer.lower()
 
     latency = int((time.time() - start) * 1000)
-    logger.info(f"Resposta gerada em {latency}ms (strategy={strategy}).")
+    logger.info(f"Resposta gerada em {latency}ms.")
 
     return RAGResponse(
         answer=answer,
@@ -126,5 +117,4 @@ def ask(
             for c in relevant
         ],
         latency_ms=latency,
-        strategy=strategy,
     )

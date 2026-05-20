@@ -84,8 +84,6 @@ CREATE TABLE IF NOT EXISTS qa_attempts (
     attempt_number     INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 3),
     question           TEXT NOT NULL,
     answer             TEXT NOT NULL,
-    retrieval_strategy TEXT NOT NULL DEFAULT 'default'
-                       CHECK (retrieval_strategy IN ('default', 'query_rewrite', 'widen_k')),
     retrieved_chunks   JSONB,
     was_fallback       BOOLEAN DEFAULT FALSE,
     latency_ms         INTEGER,

@@ -82,7 +82,6 @@ def escalation(db, student):
         db.add(QAAttempt(
             session_id=sess.id, attempt_number=i,
             question=f"Q{i}", answer=f"A{i}",
-            retrieval_strategy="default",
             feedback_signal="explicit_no",
         ))
     esc = Escalation(

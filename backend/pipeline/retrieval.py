@@ -1,60 +1,56 @@
-"""Estratégias de recuperação usadas nas tentativas 1–3 da sessão.
+"""Retrieval híbrido (BM25 + denso) com fusão por RRF.
 
-A tentativa N escolhe uma estratégia diferente para aumentar a chance
-de achar um chunk relevante mesmo quando o RAG "default" falhou.
+Devolve uma lista de chunks ``{id, score, ...}`` no mesmo formato de
+``pipeline.vector_store.search``.
 
-- ``default``       — retrieval híbrido (BM25 + denso) com variantes de
-                       acento/sigla, fundido por RRF, opcionalmente
-                       filtrado por categoria do documento.
-- ``query_rewrite`` — LLM reformula a pergunta em 3 variantes; mesma
-                       busca híbrida em todas, união pelo RRF.
-- ``widen_k``       — descarta filtro de categoria, mantém híbrido.
-
-Cada função devolve uma lista de chunks ``{id, score, ...}`` no mesmo
-formato de ``pipeline.vector_store.search``.
+Sinais combinados:
+  - Denso (nomic-embed-text): paráfrase e semântica geral. Roda em
+    variantes de acento e expansão de sigla (``query_variants``).
+  - BM25: match literal — nomes próprios, siglas raras, tokens-chave
+    que o embedding dilui. Cobre o caso de aluno usar vocabulário
+    diferente do documento sem precisar de regex hardcoded.
+  - Overlap cru de tokens: complementa BM25 em corpora pequenos onde
+    IDF satura. Doc-agnóstico — pura contagem de tokens em comum.
+  - Boost por categoria detectada: quando a query menciona uma sigla
+    registrada (ADA, TCC, PPC, ...), uma busca EXTRA restrita aos chunks
+    daquela categoria entra no RRF. Compensa o problema de docs pequenos
+    sumirem na busca global quando há um doc grande tipo PPC (~970
+    chunks). Pra novo doc ser priorizado, basta registrar sua sigla em
+    ``ACRONYM_TO_CATEGORY``.
 
 Histórico
 ---------
-Versões anteriores tinham:
-  - ``_CONCEPT_EXPANSIONS``: regex pattern → tokens, hardcoded por
-    domínio ("quanto vale" → "pontos", etc.).
-  - ``_lexical_boost``: bônus manual por overlap de keywords.
-  - ``CATEGORY_BOOST``: bônus por chunk vir da busca filtrada por
-    categoria detectada via siglas/keywords.
-Todas essas peças resolviam o sintoma específico de queries onde
-o aluno usa vocabulário diferente do documento, mas eram
-band-aids: cada novo documento exigia editar regex e listas de
-keywords.
+Antes existiam três estratégias intercambiáveis (``default`` /
+``query_rewrite`` / ``widen_k``), escolhidas pela tentativa atual da
+sessão (1/2/3). A ideia era "tentar diferente" quando a anterior falhou.
 
-Foram REMOVIDAS e substituídas por BM25 (lexical) + RRF (fusão).
-BM25 pega match literal de qualquer token (incluindo siglas, nomes
-próprios e números de artigo) sem nenhum hardcoding por documento.
+O eval mostrou que:
+- ``query_rewrite`` (LLM reformula a pergunta em 3 variantes) custava
+  uma chamada extra de LLM por tentativa e dava ganho marginal já que
+  BM25 cobria a maior parte do benefício (sinônimos).
+- ``widen_k`` (drop do filtro de categoria + k maior) raramente entrava
+  em ação porque a tentativa 3 quase sempre escala antes.
+
+Ambas removidas. Restou esta função única, equivalente ao antigo
+``default``. A lógica de "3 tentativas → escala" permanece em
+``services.session_manager.plan_interaction`` — o que muda entre as
+tentativas é a pergunta do aluno (ele reformulou), não a estratégia.
+
+Versões mais antigas também tinham ``_CONCEPT_EXPANSIONS`` (regex pattern
+→ tokens hardcoded por domínio) e ``_lexical_boost``. Substituídos por
+BM25 + RRF, doc-agnósticos.
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
-import sys
 import unicodedata
-from typing import Literal
 
 from config import settings
 from pipeline.acronyms import detect_categories, query_variants
 from pipeline.embedder import embed_text
-from pipeline.llm import generate
 from pipeline.vector_store import search
 
 logger = logging.getLogger(__name__)
-
-Strategy = Literal["default", "query_rewrite", "widen_k"]
-STRATEGIES: tuple[Strategy, ...] = ("default", "query_rewrite", "widen_k")
-
-
-def strategy_for_attempt(attempt_number: int) -> Strategy:
-    """Mapeamento 1→default, 2→query_rewrite, 3→widen_k (clamp)."""
-    idx = max(1, min(attempt_number, 3)) - 1
-    return STRATEGIES[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -155,22 +151,9 @@ def _dense_with_variants(
 def _hybrid_search(
     question: str, *, n_results: int | None, where: dict | None
 ) -> list[dict]:
-    """Busca híbrida: denso (com variantes de acento e sigla) + BM25,
-    com boost via busca extra restrita à categoria detectada na query
-    (se houver sigla). Tudo fundido por RRF.
-
-    Sinais combinados:
-      - Denso (nomic-embed-text): paráfrase e semântica geral.
-      - BM25: match literal — nomes próprios, siglas raras, tokens-chave
-              que o embedding dilui.
-      - Categoria detectada: quando a query menciona uma sigla registrada
-              (ADA, TCC, PPC, ...), uma busca EXTRA restrita aos chunks
-              daquela categoria entra no RRF. Compensa o problema de
-              docs pequenos (poucos chunks) sumirem na busca global pra
-              docs grandes (PPC com ~970 chunks). Doc-agnóstico: pra
-              novo doc ser priorizado, basta registrar sua sigla em
-              ``ACRONYM_TO_CATEGORY``.
-    """
+    """Busca híbrida: denso (com variantes de acento e sigla) + BM25 +
+    overlap lexical, com boost via busca extra restrita à categoria
+    detectada na query (se houver sigla). Tudo fundido por RRF."""
     rankings: list[list[dict]] = []
 
     # Denso com variantes
@@ -205,110 +188,28 @@ def _hybrid_search(
 
 
 # ---------------------------------------------------------------------------
-# default
+# API pública
 # ---------------------------------------------------------------------------
-
-def retrieve_default(question: str, category: str | None) -> list[dict]:
-    where = {"category": category} if category else None
-    return _hybrid_search(question, n_results=None, where=where)
-
-
-# ---------------------------------------------------------------------------
-# query_rewrite
-# ---------------------------------------------------------------------------
-
-_REWRITE_PROMPT = (
-    "Você ajuda um sistema de busca semântica. Dada a pergunta original "
-    "de um aluno, gere 3 reformulações diferentes que preservem o "
-    "significado mas variem vocabulário e estrutura. Inclua sinônimos "
-    "acadêmicos quando fizer sentido.\n\n"
-    "Responda APENAS um JSON no formato: "
-    '{"rewrites": ["...", "...", "..."]}\n\n'
-    "Pergunta original: {question}\n\n"
-    "JSON:"
-)
-
-_JSON_BLOCK_RE = re.compile(r"\{.*?\}", re.DOTALL)
-
-
-def _parse_rewrites(raw: str) -> list[str]:
-    m = _JSON_BLOCK_RE.search(raw or "")
-    if not m:
-        return []
-    try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
-    out = obj.get("rewrites") or []
-    if not isinstance(out, list):
-        return []
-    return [str(x).strip() for x in out if isinstance(x, (str, int, float)) and str(x).strip()]
-
-
-def rewrite_query(question: str) -> list[str]:
-    """Chama o LLM para gerar variações. Falha → lista vazia (sem quebrar)."""
-    try:
-        raw = generate(_REWRITE_PROMPT.replace("{question}", question))
-    except Exception as e:  # pragma: no cover - log path
-        logger.warning(f"query_rewrite falhou: {e}")
-        return []
-    rewrites = _parse_rewrites(raw)
-    logger.info(f"query_rewrite gerou {len(rewrites)} variações")
-    return rewrites[:3]
-
-
-def retrieve_with_query_rewrite(question: str, category: str | None) -> list[dict]:
-    """Busca com a pergunta original + até 3 variações. Fusão RRF."""
-    where = {"category": category} if category else None
-    rankings: list[list[dict]] = [_hybrid_search(question, n_results=None, where=where)]
-    for variant in rewrite_query(question):
-        try:
-            rankings.append(_hybrid_search(variant, n_results=None, where=where))
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"busca da variante falhou: {e}")
-    return _rrf_fuse(rankings)
-
-
-# ---------------------------------------------------------------------------
-# widen_k
-# ---------------------------------------------------------------------------
-
-WIDEN_K_CAP = 10
-
-
-def retrieve_with_widen_k(question: str, _category: str | None) -> list[dict]:
-    """Aumenta k e remove filtro de categoria (busca em tudo)."""
-    k = min(WIDEN_K_CAP, max(settings.max_chunks_retrieved * 2, settings.max_chunks_retrieved))
-    return _hybrid_search(question, n_results=k, where=None)
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
-
-_DISPATCH: dict[str, str] = {
-    "default": "retrieve_default",
-    "query_rewrite": "retrieve_with_query_rewrite",
-    "widen_k": "retrieve_with_widen_k",
-}
-
 
 def retrieve(
     question: str,
     *,
     category: str | None = None,
-    strategy: Strategy = "default",
     use_reranker: bool | None = None,
 ) -> list[dict]:
-    """Recupera chunks usando a estratégia escolhida e (opcionalmente)
+    """Recupera chunks relevantes pra ``question`` e (opcionalmente)
     reranqueia com cross-encoder.
 
-    ``use_reranker``: None → segue ``settings.enable_reranker``. True/False
-    força o comportamento (útil pro eval harness comparar A/B).
+    Parâmetros:
+        question: pergunta do aluno (já pode vir com prior_question
+                  concatenado pelo caller — ver ``rag_engine.ask``).
+        category: filtra a busca por categoria de documento. Se None,
+                  busca em tudo + boost por categoria detectada na query.
+        use_reranker: None → segue ``settings.enable_reranker``. True/False
+                      força o comportamento (útil pro eval harness).
     """
-    fn_name = _DISPATCH.get(strategy, "retrieve_default")
-    fn = getattr(sys.modules[__name__], fn_name)
-    chunks = fn(question, category)
+    where = {"category": category} if category else None
+    chunks = _hybrid_search(question, n_results=None, where=where)
 
     if use_reranker is None:
         use_reranker = settings.enable_reranker

@@ -66,7 +66,6 @@ def session_with_3_attempts(db, student):
             attempt_number=i,
             question=f"Q{i}",
             answer=f"A{i} (provavelmente errada)",
-            retrieval_strategy=["default", "query_rewrite", "widen_k"][i - 1],
             feedback_signal="explicit_no" if i < 3 else None,
         ))
     db.commit()
@@ -81,8 +80,7 @@ def test_summarize_attempts_empty_returns_placeholder():
 
 
 def test_summarize_attempts_uses_llm_output():
-    att = QAAttempt(attempt_number=1, question="Q", answer="A",
-                    retrieval_strategy="default")
+    att = QAAttempt(attempt_number=1, question="Q", answer="A")
     with patch("services.escalation_service.generate",
                return_value="Resumo gerado pelo LLM."):
         out = summarize_attempts([att])
@@ -91,7 +89,7 @@ def test_summarize_attempts_uses_llm_output():
 
 def test_summarize_attempts_falls_back_when_llm_raises():
     att = QAAttempt(attempt_number=1, question="Qual a duração?",
-                    answer="A errada", retrieval_strategy="default")
+                    answer="A errada")
     with patch("services.escalation_service.generate",
                side_effect=RuntimeError("ollama down")):
         out = summarize_attempts([att])
@@ -100,8 +98,7 @@ def test_summarize_attempts_falls_back_when_llm_raises():
 
 
 def test_summarize_attempts_fallback_on_empty_llm():
-    att = QAAttempt(attempt_number=1, question="Q", answer="A",
-                    retrieval_strategy="default")
+    att = QAAttempt(attempt_number=1, question="Q", answer="A")
     with patch("services.escalation_service.generate", return_value="   "):
         out = summarize_attempts([att])
     assert "indisponível" in out.lower()
@@ -161,7 +158,7 @@ def test_create_escalation_preserves_session_if_already_escalated(
     assert session_with_3_attempts.closed_at == closed_before
 
 
-def test_render_attempts_includes_strategy_and_feedback(
+def test_render_attempts_includes_attempts_and_feedback(
     db, student, session_with_3_attempts,
 ):
     captured = {}
@@ -175,6 +172,4 @@ def test_render_attempts_includes_strategy_and_feedback(
 
     prompt = captured["prompt"]
     assert "Tentativa 1" in prompt and "Tentativa 3" in prompt
-    assert "query_rewrite" in prompt
-    assert "widen_k" in prompt
     assert "explicit_no" in prompt

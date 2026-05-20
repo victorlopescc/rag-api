@@ -97,7 +97,6 @@ def seeded(db):
     db.add(QAAttempt(
         session_id=s1.id, attempt_number=1,
         question="carga horária?", answer="3200h",
-        retrieval_strategy="default",
         was_fallback=False, latency_ms=900,
         feedback_signal="explicit_yes", resolved=True,
         retrieved_chunks=[{"document_id": str(doc_a.id), "score": 0.7}],
@@ -111,15 +110,14 @@ def seeded(db):
         closing_feedback="not_resolved",
     )
     db.add(s2); db.flush()
-    for i, strat, sig in [
-        (1, "default", "explicit_no"),
-        (2, "query_rewrite", "implicit_rephrase"),
-        (3, "widen_k", "timeout"),
+    for i, sig in [
+        (1, "explicit_no"),
+        (2, "implicit_rephrase"),
+        (3, "timeout"),
     ]:
         db.add(QAAttempt(
             session_id=s2.id, attempt_number=i,
             question=f"Q{i}", answer="Não encontrei...",
-            retrieval_strategy=strat,
             was_fallback=True, latency_ms=1500 + i * 100,
             feedback_signal=sig,
             retrieved_chunks=[{"document_id": str(doc_a.id), "score": 0.1}],
@@ -197,31 +195,11 @@ def test_overview_rejects_inverted_range(client, seeded, api_headers):
     assert r.status_code == 400
 
 
-def test_strategies_per_strategy_counts(client, seeded, api_headers):
+def test_strategies_endpoint_was_removed(client, seeded, api_headers):
+    """Endpoint /admin/analytics/strategies foi removido junto com a lógica
+    de múltiplas estratégias de retrieval. Garante que retorna 404."""
     r = client.get("/admin/analytics/strategies", headers=api_headers)
-    assert r.status_code == 200
-    d = r.json()
-    by_strat = {row["strategy"]: row for row in d["per_strategy"]}
-    # default has 2 attempts (1 from resolved + 1 from escalated)
-    assert by_strat["default"]["attempts"] == 2
-    assert by_strat["default"]["explicit_yes"] == 1
-    assert by_strat["default"]["explicit_no"] == 1
-    assert by_strat["query_rewrite"]["attempts"] == 1
-    assert by_strat["query_rewrite"]["implicit_rephrase"] == 1
-    assert by_strat["widen_k"]["timeout"] == 1
-    # fallback rate on default: 1/2
-    assert by_strat["default"]["fallback_rate"] == pytest.approx(0.5, rel=1e-3)
-
-
-def test_strategies_feedback_by_attempt(client, seeded, api_headers):
-    r = client.get("/admin/analytics/strategies", headers=api_headers)
-    d = r.json()
-    per_n = {row["attempt_number"]: row for row in d["feedback_by_attempt"]}
-    # attempt 1 had explicit_yes + explicit_no
-    assert per_n[1]["explicit_yes"] == 1
-    assert per_n[1]["explicit_no"] == 1
-    assert per_n[2]["implicit_rephrase"] == 1
-    assert per_n[3]["timeout"] == 1
+    assert r.status_code == 404
 
 
 def test_escalations_report(client, seeded, api_headers):
@@ -299,7 +277,7 @@ def test_documents_report_handles_legacy_string_chunks(db, client, api_headers):
     db.add(QAAttempt(
         session_id=sess.id, attempt_number=1,
         question="q", answer="a",
-        retrieval_strategy="default", was_fallback=False, latency_ms=100,
+        was_fallback=False, latency_ms=100,
         retrieved_chunks=["legacy-chroma-1"],  # shape antigo
     ))
     db.commit()

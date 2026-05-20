@@ -81,6 +81,28 @@ THANKS_REPLY = """De nada! 😊
 Quando tiver outra dúvida sobre o curso, é só mandar."""
 
 
+# Sufixo anexado a CADA resposta do RAG. Pede feedback explícito do
+# aluno em vez de inferir intenção via LLM no próximo turno. Pedido
+# expresso da coordenação no design do piloto: cada interação gera um
+# datapoint claro de satisfação.
+FEEDBACK_PROMPT_SUFFIX = """
+
+━━━━━━━━━━━━━━━━━━━
+*Conseguiu resolver sua dúvida?*
+*1* — Sim, obrigado ✅
+*2* — Não, vou reformular
+*3* — Falar com o coordenador"""
+
+
+# Resposta ao aluno que digitou "2" pedindo reformulação.
+# Mantém a sessão aberta — a próxima mensagem dele é tratada como
+# rephrase (incrementa attempt; na 3ª tentativa o sistema escala
+# automaticamente pro coordenador).
+REPHRASE_ACK = """Beleza! 💪
+
+Manda a pergunta reformulada que eu tento responder de novo, agora com mais cuidado."""
+
+
 # ============================================================================
 # Live thread (conversa ao vivo aluno ↔ coordenador)
 # ============================================================================

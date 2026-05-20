@@ -15,8 +15,10 @@ from services.whatsapp import (
     CANCEL_REPLY_NOTHING,
     CANCEL_REPLY_OK,
     FALLBACK_HINT_SUFFIX,
+    FEEDBACK_PROMPT_SUFFIX,
     GREETING_REPLY,
     HELP_MESSAGE,
+    REPHRASE_ACK,
     THANKS_REPLY,
     THREAD_CLOSED_BY_STUDENT_NOTICE,
     TRIVIAL_REPLY,
@@ -175,12 +177,22 @@ async def _apply_text_vote(
     """Aplica o voto recebido por texto (1/2/3) na sessão.
 
     Lógica:
-    - feedback ``not_resolved`` → SEMPRE escala (idempotente). Se a
-      sessão estava aberta, fecha como escalated. Se já estava fechada,
-      cria escalation mesmo assim e marca closing_feedback.
-    - feedback ``resolved_*`` → grava closing_feedback. Se a sessão
+    - feedback ``wants_rephrase`` → NÃO fecha. Avisa o aluno pra mandar
+      a pergunta reformulada. A próxima mensagem dele entra no fluxo
+      normal e será classificada como rephrase.
+    - feedback ``not_resolved`` → SEMPRE escala (idempotente).
+    - feedback ``resolved_fully`` → grava closing_feedback. Se a sessão
       estava aberta, fecha como resolved.
     """
+    # "2" (wants_rephrase) NÃO marca closing_feedback nem fecha sessão.
+    # Trata como sinal intermediário e deixa o fluxo seguir.
+    if feedback == "wants_rephrase":
+        try:
+            await evolution_client.send_text(student.phone_number, REPHRASE_ACK)
+        except Exception as e:
+            logger.error(f"Erro enviando ack de rephrase: {e}")
+        return {"status": "text_vote_rephrase"}
+
     session.closing_feedback = feedback
 
     if feedback == "not_resolved":
@@ -209,20 +221,15 @@ async def _apply_text_vote(
             return {"status": "text_vote_escalated"}
         return {"status": "text_vote_already_escalated"}
 
-    # resolved_fully ou resolved_partially
+    # resolved_fully (único caso restante chegando aqui).
     if session.status == "open":
         session_manager.close_as_resolved(db, session)
     db.commit()
     try:
-        if feedback == "resolved_fully":
-            ack = "Que bom! 🎓 Fechando como totalmente resolvido."
-        else:  # resolved_partially
-            ack = (
-                "Anotado: resolvido parcialmente. 🎓 Se quiser detalhar o "
-                "que ainda ficou em aberto, é só me chamar — ou envie "
-                "*/coordenador* pra falar direto com o coordenador."
-            )
-        await evolution_client.send_text(student.phone_number, ack)
+        await evolution_client.send_text(
+            student.phone_number,
+            "Que bom! 🎓 Fechando como resolvido. Quando precisar de algo, é só mandar.",
+        )
     except Exception as e:
         logger.error(f"Erro confirmando voto: {e}")
     return {"status": "text_vote_recorded", "feedback": feedback}
@@ -277,28 +284,38 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
         return {"status": "unknown_sender"}
 
     # 1.5. Voto por TEXTO. O aluno respondeu "1"/"2"/"3" depois de receber
-    # as instruções pós-attempt-3 (ou similar). Pega a última sessão
-    # recente do aluno (≤ 30 min) e aplica como voto. Esse é o caminho
-    # principal — a poll do WhatsApp não funciona em Evolution v1.8.7.
+    # uma resposta do bot com o prompt de feedback anexado. Pega a sessão
+    # ABERTA do aluno e aplica como voto. Esse é o caminho principal — a
+    # poll nativa do WhatsApp não funciona em Evolution v1.8.7.
+    #
+    # IMPORTANTE: só considera sessão ABERTA. Se a sessão recente já foi
+    # fechada (resolved/escalated/abandoned), o "1"/"2"/"3" perdeu o
+    # contexto — não faz sentido reaplicar voto numa sessão encerrada
+    # (causaria "fechou como resolvido" sem que o aluno esperasse). Cai
+    # pra triagem normal, que provavelmente trata como trivial.
     text_vote = session_manager.text_vote_for(msg["text"])
     if text_vote is not None:
         cutoff = _dt.now(timezone.utc) - _TEXT_VOTE_WINDOW
-        last_session = (
+        open_session = (
             db.query(QASession)
             .filter(
                 QASession.student_id == student.id,
+                QASession.status == "open",
                 QASession.opened_at >= cutoff,
             )
             .order_by(QASession.opened_at.desc())
             .first()
         )
-        if last_session is not None:
+        if open_session is not None:
             logger.info(
                 f"Voto por texto '{msg['text']}' → feedback={text_vote} "
-                f"(session {last_session.id} status={last_session.status})"
+                f"(session {open_session.id} status=open)"
             )
-            return await _apply_text_vote(db, last_session, text_vote, student)
-        # Sem sessão recente → trata como mensagem normal (cai pra triagem).
+            return await _apply_text_vote(db, open_session, text_vote, student)
+        # Sem sessão aberta → trata como mensagem normal (cai pra triagem).
+        logger.info(
+            f"Voto por texto '{msg['text']}' ignorado — sem sessão aberta."
+        )
 
     # 1.55. LIVE THREAD: se o aluno está numa conversa ao vivo com o
     # coordenador, PULAMOS toda a triagem do bot — qualquer mensagem
@@ -417,7 +434,7 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
             logger.error(f"Erro avisando escalação: {e}")
         return {"status": "escalated"}
 
-    # 5. answer: roda RAG com a estratégia planejada e registra a tentativa.
+    # 5. answer: roda RAG e registra a tentativa.
     # `prior_question` mantém o tópico no retrieval em follow-ups
     # ("quanto tempo tem a prova?" depois de "quando vai ser a ADA?").
     #
@@ -429,7 +446,6 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
     result = await run_in_threadpool(
         ask,
         question=msg["text"],
-        strategy=plan.strategy,
         prior_question=plan.prior_question,
     )
     _log_query(db, student, msg["text"], result)
@@ -445,19 +461,21 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
         logger.error(f"Erro ao registrar QAAttempt: {e}")
         db.rollback()
 
-    # Quando o RAG retorna fallback, anexamos um hint orientando o aluno
-    # ("tente reformular OU envie /coordenador"). O fallback puro vinha
-    # seco demais e deixava o aluno sem saber o próximo passo.
-    answer_to_send = result.answer
+    # Anexa o prompt de feedback (1/2/3) em TODA resposta do RAG. O
+    # aluno vê a resposta + as opções no mesmo balão do WhatsApp.
+    # Fallback ainda recebe o hint específico no meio (sugere reformular
+    # ou /coordenador) — depois vêm as opções 1/2/3 que cobrem ambos.
     if result.was_fallback:
-        answer_to_send = result.answer + FALLBACK_HINT_SUFFIX
+        answer_to_send = result.answer + FALLBACK_HINT_SUFFIX + FEEDBACK_PROMPT_SUFFIX
+    else:
+        answer_to_send = result.answer + FEEDBACK_PROMPT_SUFFIX
 
     try:
         await evolution_client.send_text(student.phone_number, answer_to_send)
     except Exception as e:
         logger.error(f"Erro ao enviar mensagem: {e}")
 
-    # Após a 3ª tentativa (widen_k), em vez de esperar uma 4ª mensagem
+    # Após a 3ª tentativa, em vez de esperar uma 4ª mensagem
     # de frustração ("ainda não respondeu"), forçamos uma decisão final:
     # texto bonito pedindo 1/2/3. O voto é processado pelo handler de
     # text vote (que olha a última sessão recente do aluno).
@@ -469,7 +487,7 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
         except Exception as e:
             logger.error(f"Erro enviando opções pós-3a: {e}")
 
-    return {"status": "ok", "strategy": plan.strategy}
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

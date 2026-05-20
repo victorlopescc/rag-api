@@ -116,7 +116,6 @@ def test_plan_without_open_session_opens_new(db, student, llm_classifier):
 
     assert plan.action == "answer"
     assert plan.attempt_number == 1
-    assert plan.strategy == "default"
     assert plan.prior_intent == "none"
     # Uma sessão aberta, zero tentativas (record_attempt é separado).
     assert db.query(QASession).count() == 1
@@ -179,7 +178,6 @@ def test_plan_no_keeps_session_and_bumps_strategy(db, student, llm_classifier):
 
     assert p2.action == "answer"
     assert p2.attempt_number == 2
-    assert p2.strategy == "query_rewrite"
     assert p2.session_id == p1.session_id
 
     last = db.query(QAAttempt).first()
@@ -197,7 +195,6 @@ def test_plan_rephrase_also_bumps(db, student, llm_classifier):
     db.commit()
 
     assert p2.attempt_number == 2
-    assert p2.strategy == "query_rewrite"
     last = db.query(QAAttempt).first()
     assert last.feedback_signal == "implicit_rephrase"
 
@@ -303,7 +300,7 @@ def test_plan_unclear_treated_as_rephrase(db, student, llm_classifier):
     assert p2.attempt_number == 2
 
 
-def test_third_attempt_uses_widen_k(db, student, llm_classifier):
+def test_third_attempt_keeps_session_open(db, student, llm_classifier):
     p1 = plan_interaction(db, student, "Q1")
     record_attempt(db, p1, question="Q1", answer="A1")
     db.commit()
@@ -317,7 +314,6 @@ def test_third_attempt_uses_widen_k(db, student, llm_classifier):
     db.commit()
 
     assert p3.attempt_number == 3
-    assert p3.strategy == "widen_k"
 
 
 def test_fourth_attempt_escalates(db, student, llm_classifier):
@@ -417,7 +413,7 @@ def test_plan_sentinel_works_without_open_session(db, student, llm_classifier):
 
 @pytest.mark.parametrize("text,expected", [
     ("1", "resolved_fully"),
-    ("2", "resolved_partially"),
+    ("2", "wants_rephrase"),  # mudado: era resolved_partially
     ("3", "not_resolved"),
     (" 1 ", "resolved_fully"),  # trim
     ("4", None),
@@ -482,7 +478,6 @@ def test_record_attempt_persists_all_fields(db, student, llm_classifier):
 
     att = db.query(QAAttempt).one()
     assert att.attempt_number == 1
-    assert att.retrieval_strategy == "default"
     assert att.retrieved_chunks == [
         {"id": "c1", "document_id": "d1", "score": 0.9},
         {"id": "c2", "document_id": "d1", "score": 0.8},

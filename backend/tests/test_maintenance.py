@@ -64,7 +64,7 @@ def _make_session(db, student, *, opened_at=None, with_attempt_at=None):
     if with_attempt_at is not None:
         att = QAAttempt(
             session_id=sess.id, attempt_number=1,
-            question="Q", answer="A", retrieval_strategy="default",
+            question="Q", answer="A",
         )
         att.created_at = with_attempt_at
         db.add(att)

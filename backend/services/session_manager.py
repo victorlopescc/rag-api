@@ -1,11 +1,9 @@
 """Gerenciamento de sessões de perguntas (Q&A) para avaliação do bot (TCC).
 
-API pública é dividida em duas fases para acomodar a escolha de estratégia
-de retrieval *antes* de chamar o RAG:
+API pública é dividida em duas fases:
 
 1. ``plan_interaction(db, student, message)`` — classifica a mensagem,
-   decide se é ``ack_yes`` / ``answer`` / ``escalate``, escolhe a
-   estratégia de retrieval para a próxima tentativa e atualiza o estado
+   decide se é ``ack_yes`` / ``answer`` / ``escalate`` e atualiza o estado
    da sessão (fecha antigas, abre novas). **Não** executa o RAG.
 2. ``record_attempt(db, plan, question, answer, chunks_used, ...)``
    persiste a QAAttempt depois que o webhook rodou o RAG.
@@ -15,6 +13,12 @@ Também expõe utilitários de ciclo de vida:
 - ``close_as_abandoned(db, session, poll_id=None)``
 - ``close_as_escalated(db, session)``
 - ``apply_poll_vote(db, poll_id, feedback)``
+
+Histórico: o plano também escolhia uma "estratégia de retrieval"
+(default/query_rewrite/widen_k) por tentativa. Removido — hoje todas
+as tentativas usam o mesmo retrieval híbrido (``pipeline.retrieval``).
+O que muda entre as tentativas é a pergunta do aluno (ele reformula);
+a regra de escalar na 4ª tentativa permanece.
 """
 from __future__ import annotations
 
@@ -28,7 +32,6 @@ from typing import Literal
 from sqlalchemy.orm import Session
 
 from database import QAAttempt, QASession, Student, utcnow
-from pipeline.retrieval_strategies import Strategy, strategy_for_attempt
 
 # ---------------------------------------------------------------------------
 # Regex fast-path (somente "yes" — nem ``no`` nem ``new_topic`` passam aqui
@@ -96,7 +99,6 @@ class SessionPlan:
     # é só um ack educado fora do fluxo de sessões).
     session_id: uuid.UUID | None
     attempt_number: int          # 0 quando action ∈ {"ack_yes", "thanks"}
-    strategy: Strategy           # relevante quando action == "answer"
     prior_intent: str            # 'yes'|'no'|'rephrase'|'new_topic'|'unclear'|'none'|'thanks_no_session'|'sentinel_escalation'
     # Texto da pergunta anterior NA MESMA SESSÃO. Usado pelo RAG só para
     # retrieval (manter o tópico) — o prompt do LLM continua vendo só a
@@ -313,7 +315,6 @@ def plan_interaction(
             action="escalate",
             session_id=open_session.id,
             attempt_number=attempt,
-            strategy="default",
             prior_intent="sentinel_escalation",
         )
 
@@ -326,7 +327,6 @@ def plan_interaction(
             action="thanks",
             session_id=None,
             attempt_number=0,
-            strategy="default",
             prior_intent="thanks_no_session",
         )
 
@@ -339,7 +339,6 @@ def plan_interaction(
             action="answer",
             session_id=new.id,
             attempt_number=1,
-            strategy=strategy_for_attempt(1),
             prior_intent="none",
             # Lookback de 5 min, mas só anexa se a mensagem atual NÃO
             # já carregar o tópico (sigla detectada). Evita arrastar
@@ -358,7 +357,6 @@ def plan_interaction(
             action="ack_yes",
             session_id=open_session.id,
             attempt_number=0,
-            strategy="default",
             prior_intent="yes",
         )
 
@@ -377,7 +375,6 @@ def plan_interaction(
             action="answer",
             session_id=new.id,
             attempt_number=1,
-            strategy=strategy_for_attempt(1),
             prior_intent="new_topic",
             prior_question=_choose_prior(_recent_question(db, student), message),
         )
@@ -398,7 +395,6 @@ def plan_interaction(
             action="escalate",
             session_id=open_session.id,
             attempt_number=_attempt_count(db, open_session),
-            strategy="default",
             prior_intent=intent,
         )
 
@@ -406,7 +402,6 @@ def plan_interaction(
         action="answer",
         session_id=open_session.id,
         attempt_number=next_attempt,
-        strategy=strategy_for_attempt(next_attempt),
         prior_intent=intent,
         # Mesma sessão: prior é a pergunta anterior, mas só se a nova
         # ainda for do mesmo tópico (ou se a nova não tem sigla, caso
@@ -443,7 +438,6 @@ def record_attempt(
         attempt_number=plan.attempt_number,
         question=question,
         answer=answer,
-        retrieval_strategy=plan.strategy,
         retrieved_chunks=chunks_used or [],
         was_fallback=was_fallback,
         latency_ms=latency_ms,
@@ -466,7 +460,7 @@ def record_attempt(
 # enviada após "obrigado"), só registra o feedback. Mesmo conjunto de
 # opções é usado em 3 momentos:
 #   1. Após "obrigado"/yes (sessão já fechada como resolved).
-#   2. Após a 3ª tentativa (widen_k) — sessão ainda aberta, decisão final.
+#   2. Após a 3ª tentativa — sessão ainda aberta, decisão final.
 #   3. Após escalação criada (sessão já fechada como escalated).
 POLL_QUESTION = "O bot conseguiu te ajudar?"
 POLL_OPTIONS = [
@@ -542,16 +536,21 @@ def is_escalation_sentinel(text: str) -> bool:
     return norm in _ESCALATION_SENTINELS
 
 
-# Respostas em texto que substituem o clique nas opções da poll.
-# Usado como fallback caso a Evolution não esteja enviando webhooks
-# de voto (bug conhecido em algumas configs do Baileys).
-# Mantemos os 3 fluxos: resolved_fully, resolved_partially, escalate.
+# Respostas em texto da poll de feedback que aparece em cada resposta do
+# RAG. O webhook intercepta esses códigos antes da triagem normal:
+#
+#   "1" → resolveu — fecha sessão como ``resolved``
+#   "2" → quer reformular — NÃO fecha sessão; bot manda ack pedindo a
+#         nova pergunta; quando ela chega, ``plan_interaction`` trata
+#         como rephrase (incrementa attempt — na 3ª, escala automático)
+#   "3" → não resolveu — escala pro coordenador
+#
+# A semântica do "2" mudou: antes era "resolveu parcialmente" (fechava
+# como ``resolved_partially``). Hoje significa "vou tentar de novo",
+# alinhado ao fluxo de feedback contínuo desenhado pela coordenação.
 _TEXT_VOTE_MAP: dict[str, str] = {
-    # Opção 1 — Resolveu totalmente
     "1": "resolved_fully",
-    # Opção 2 — Resolveu parcialmente
-    "2": "resolved_partially",
-    # Opção 3 — Não resolveu, falar com coordenador
+    "2": "wants_rephrase",
     "3": "not_resolved",
 }
 

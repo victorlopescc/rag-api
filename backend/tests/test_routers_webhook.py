@@ -1,4 +1,4 @@
-"""Testa o router /webhook (milestone 2) — classificação + estratégias + poll."""
+"""Testa o router /webhook — classificação, sessões, votos por texto e poll."""
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -59,14 +59,13 @@ def _upsert_body(
     }
 
 
-def _plan(action="answer", attempt=1, strategy="default",
-          session_id=None, prior_intent="none"):
+def _plan(action="answer", attempt=1, session_id=None, prior_intent="none"):
     return MagicMock(
         action=action,
         attempt_number=attempt,
-        strategy=strategy,
         session_id=session_id or uuid.uuid4(),
         prior_intent=prior_intent,
+        prior_question=None,
     )
 
 
@@ -109,12 +108,15 @@ def test_duplicate_message_is_detected(client, mock_db):
 
 # --- action: answer --------------------------------------------------------
 
-def test_answer_path_uses_strategy_from_plan(client, mock_db):
+def test_answer_path_calls_ask_and_records_attempt(client, mock_db):
+    """Caminho answer: roda ``ask``, registra attempt e envia a resposta."""
     student = _student()
     mock_db.query.return_value.filter.return_value.first.return_value = student
     fake = RAGResponse(answer="4 anos", was_fallback=False, chunks_used=[], latency_ms=1)
 
-    plan = _plan(action="answer", attempt=2, strategy="query_rewrite")
+    # attempt=2 evita o segundo send_text do POST_ATTEMPT3_PROMPT (que só
+    # dispara em attempt==3) e mantém a asserção de 1 chamada.
+    plan = _plan(action="answer", attempt=2)
     ask_mock = MagicMock(return_value=fake)
     send = AsyncMock()
 
@@ -125,9 +127,8 @@ def test_answer_path_uses_strategy_from_plan(client, mock_db):
         resp = client.post("/webhook", json=_upsert_body(msg_id="M-A"))
 
     assert resp.json()["status"] == "ok"
-    assert resp.json()["strategy"] == "query_rewrite"
-    # Estratégia foi passada ao RAG.
-    assert ask_mock.call_args.kwargs["strategy"] == "query_rewrite"
+    ask_mock.assert_called_once()
+    assert ask_mock.call_args.kwargs["question"] == "Qual a duração?"
     rec.assert_called_once()
     send.assert_awaited_once()
     assert send.call_args.args[0] == student.phone_number
@@ -146,7 +147,7 @@ def test_log_query_extracts_ids_from_dict_chunks(client, mock_db):
             {"id": "c-2", "document_id": "d-1", "score": 0.7},
         ],
     )
-    plan = _plan(action="answer", attempt=1, strategy="default")
+    plan = _plan(action="answer", attempt=1)
 
     with patch("routers.webhook.ask", return_value=fake), \
          patch("routers.webhook.session_manager.plan_interaction", return_value=plan), \
@@ -268,7 +269,7 @@ def test_escalate_creates_escalation_and_sends_notice(client, mock_db):
     student = _student()
     mock_db.query.return_value.filter.return_value.first.return_value = student
 
-    plan = _plan(action="escalate", attempt=3, strategy="widen_k")
+    plan = _plan(action="escalate", attempt=3)
     send_text = AsyncMock()
     send_poll = AsyncMock(return_value="POLL-E")
     ask_mock = MagicMock()
@@ -543,6 +544,81 @@ def test_text_fallback_vote_1_closes_resolved(client, mock_db):
     send_text.assert_awaited_once()
 
 
+def test_text_fallback_vote_2_keeps_session_open_and_sends_rephrase_ack(client, mock_db):
+    """Aluno responde '2' → mantém sessão aberta e manda ack pedindo
+    a pergunta reformulada. NÃO chama close_as_resolved nem cria
+    escalação."""
+    from services.whatsapp import REPHRASE_ACK
+    fake_session = MagicMock(
+        id=uuid.uuid4(),
+        status="open",
+        student_id=uuid.uuid4(),
+    )
+    fake_student = _student()
+
+    def query_dispatch(model):
+        result = MagicMock()
+        if "QASession" in str(model):
+            result.filter.return_value.order_by.return_value.first.return_value = fake_session
+            result.filter.return_value.first.return_value = fake_session
+        elif "Student" in str(model):
+            result.filter.return_value.first.return_value = fake_student
+        return result
+    mock_db.query.side_effect = query_dispatch
+
+    with patch(
+        "routers.webhook.session_manager.close_as_resolved",
+    ) as close_resolved, patch(
+        "routers.webhook.escalation_service.create_escalation",
+    ) as create_esc, patch(
+        "routers.webhook.evolution_client.send_text",
+        new_callable=AsyncMock,
+    ) as send_text:
+        body = _upsert_body(text="2", msg_id="TXT-VOTE-2")
+        resp = client.post("/webhook", json=body)
+
+    assert resp.json()["status"] == "text_vote_rephrase"
+    close_resolved.assert_not_called()
+    create_esc.assert_not_called()
+    send_text.assert_awaited_once_with(fake_student.phone_number, REPHRASE_ACK)
+    # closing_feedback NÃO foi marcado — sessão segue limpa.
+    assert fake_session.closing_feedback != "wants_rephrase"
+
+
+def test_text_vote_without_open_session_falls_through_to_triage(client, mock_db):
+    """Aluno manda '1' sem nenhuma sessão aberta → não pode reaplicar voto
+    em sessão fechada (causaria mensagem 'fechou como resolvido' fantasma).
+    Cai pra triagem normal — '1' isolado vira trivial."""
+    fake_student = _student()
+
+    def query_dispatch(model):
+        result = MagicMock()
+        if "QASession" in str(model):
+            # Nenhuma sessão aberta no momento.
+            result.filter.return_value.order_by.return_value.first.return_value = None
+        elif "Student" in str(model):
+            result.filter.return_value.first.return_value = fake_student
+        return result
+    mock_db.query.side_effect = query_dispatch
+
+    with patch(
+        "routers.webhook.session_manager.close_as_resolved",
+    ) as close_resolved, patch(
+        "routers.webhook.escalation_service.create_escalation",
+    ) as create_esc, patch(
+        "routers.webhook.evolution_client.send_text",
+        new_callable=AsyncMock,
+    ) as send_text:
+        body = _upsert_body(text="1", msg_id="TXT-VOTE-ORPHAN")
+        resp = client.post("/webhook", json=body)
+
+    # NÃO deve fechar sessão nenhuma nem escalar.
+    close_resolved.assert_not_called()
+    create_esc.assert_not_called()
+    # Status NÃO é text_vote_*: deve ter caído na triagem (trivial provavelmente).
+    assert not resp.json()["status"].startswith("text_vote_")
+
+
 def test_poll_vote_unknown_option_is_reported(client, mock_db):
     body = {
         "event": "messages.update",
@@ -677,7 +753,7 @@ def test_fallback_response_appends_hint(client, mock_db):
         answer="Não encontrei essa informação nos documentos disponíveis.",
         was_fallback=True, latency_ms=1, chunks_used=[],
     )
-    plan = _plan(action="answer", attempt=1, strategy="default")
+    plan = _plan(action="answer", attempt=1)
 
     with patch("routers.webhook.ask", return_value=fake), \
          patch("routers.webhook.session_manager.plan_interaction", return_value=plan), \
@@ -692,15 +768,16 @@ def test_fallback_response_appends_hint(client, mock_db):
     assert "/coordenador" in sent  # hint sufixo
 
 
-def test_non_fallback_response_does_not_append_hint(client, mock_db):
-    """Resposta normal NÃO recebe o sufixo de fallback."""
+def test_non_fallback_response_appends_feedback_prompt(client, mock_db):
+    """Resposta normal recebe APENAS o prompt de feedback (1/2/3),
+    sem o hint específico de fallback."""
     student = _student()
     mock_db.query.return_value.filter.return_value.first.return_value = student
     fake = RAGResponse(
         answer="A ADA será de 15 a 19 de junho.",
         was_fallback=False, latency_ms=1, chunks_used=[],
     )
-    plan = _plan(action="answer", attempt=1, strategy="default")
+    plan = _plan(action="answer", attempt=1)
 
     with patch("routers.webhook.ask", return_value=fake), \
          patch("routers.webhook.session_manager.plan_interaction", return_value=plan), \
@@ -711,4 +788,8 @@ def test_non_fallback_response_does_not_append_hint(client, mock_db):
         client.post("/webhook", json=_upsert_body(text="quando vai ser a ada?"))
 
     sent = send_text.call_args.args[1]
-    assert sent == "A ADA será de 15 a 19 de junho."  # sem hint
+    assert sent.startswith("A ADA será de 15 a 19 de junho.")
+    assert "Conseguiu resolver" in sent  # prompt de feedback
+    assert "*1*" in sent and "*2*" in sent and "*3*" in sent
+    # NÃO contém o hint de fallback ("Tente reformular com mais detalhes")
+    assert "Tente reformular com mais detalhes" not in sent

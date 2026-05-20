@@ -140,8 +140,6 @@ class QAAttempt(Base):
     attempt_number = Column(Integer, nullable=False)  # 1..3
     question = Column(Text, nullable=False)
     answer = Column(Text, nullable=False)
-    # default | query_rewrite | widen_k  (milestone 2 usa as 3; milestone 1 só default)
-    retrieval_strategy = Column(String, nullable=False, default="default")
     retrieved_chunks = Column(JSONB)  # [{id, score, document_id}, ...]
     was_fallback = Column(Boolean, default=False)
     latency_ms = Column(Integer)

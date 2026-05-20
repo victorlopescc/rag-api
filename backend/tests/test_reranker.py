@@ -111,41 +111,41 @@ def test_rerank_filters_by_min_score():
 def test_retrieve_calls_reranker_when_enabled():
     """Quando ``use_reranker=True``, retrieve() chama o cross-encoder
     e devolve chunks com ``rerank_score``."""
-    from pipeline.retrieval_strategies import retrieve
+    from pipeline.retrieval import retrieve
 
     base_chunks = [
         _chunk("a", 0.7, content="header genérico"),
         _chunk("b", 0.5, content="resposta literal: 5 pontos"),
     ]
     fake_model = _mock_cross_encoder({"5 pontos": 4.0, "header": -2.0})
-    with patch("pipeline.retrieval_strategies.retrieve_default",
+    with patch("pipeline.retrieval._hybrid_search",
                return_value=base_chunks), \
          patch("pipeline.reranker._load_model", return_value=fake_model):
-        out = retrieve("q", strategy="default", use_reranker=True)
+        out = retrieve("q", use_reranker=True)
 
     assert out[0]["id"] == "b"
     assert "rerank_score" in out[0]
 
 
 def test_retrieve_skips_reranker_when_disabled():
-    from pipeline.retrieval_strategies import retrieve
+    from pipeline.retrieval import retrieve
 
     base_chunks = [_chunk("a", 0.7), _chunk("b", 0.5)]
-    with patch("pipeline.retrieval_strategies.retrieve_default",
+    with patch("pipeline.retrieval._hybrid_search",
                return_value=base_chunks), \
          patch("pipeline.reranker._load_model") as load:
-        out = retrieve("q", strategy="default", use_reranker=False)
+        out = retrieve("q", use_reranker=False)
     load.assert_not_called()
     assert [c["id"] for c in out] == ["a", "b"]
 
 
 def test_retrieve_falls_back_when_reranker_raises():
     """Se o reranker lança, retrieve devolve a ordem do retrieval base."""
-    from pipeline.retrieval_strategies import retrieve
+    from pipeline.retrieval import retrieve
 
     base_chunks = [_chunk("a", 0.7), _chunk("b", 0.5)]
-    with patch("pipeline.retrieval_strategies.retrieve_default",
+    with patch("pipeline.retrieval._hybrid_search",
                return_value=base_chunks), \
          patch("pipeline.reranker.rerank", side_effect=RuntimeError("boom")):
-        out = retrieve("q", strategy="default", use_reranker=True)
+        out = retrieve("q", use_reranker=True)
     assert [c["id"] for c in out] == ["a", "b"]

@@ -75,7 +75,6 @@ class AttemptOut(BaseModel):
     attempt_number: int
     question: str
     answer: str
-    retrieval_strategy: str
     was_fallback: bool
     feedback_signal: str | None
     created_at: str
@@ -137,7 +136,6 @@ def _attempt_out(a: QAAttempt) -> AttemptOut:
         attempt_number=a.attempt_number,
         question=a.question,
         answer=a.answer,
-        retrieval_strategy=a.retrieval_strategy,
         was_fallback=bool(a.was_fallback),
         feedback_signal=a.feedback_signal,
         created_at=a.created_at.isoformat() if a.created_at else "",

@@ -92,34 +92,6 @@ class OverviewKPIs(BaseModel):
     median_reply_minutes: float | None
 
 
-class StrategyRow(BaseModel):
-    strategy: str
-    attempts: int
-    fallback: int
-    fallback_rate: float
-    explicit_yes: int
-    explicit_no: int
-    implicit_rephrase: int
-    implicit_new_topic: int
-    timeout: int
-    avg_latency_ms: float | None
-
-
-class FeedbackByAttempt(BaseModel):
-    attempt_number: int
-    explicit_yes: int
-    explicit_no: int
-    implicit_rephrase: int
-    implicit_new_topic: int
-    timeout: int
-    no_signal: int
-
-
-class StrategyReport(BaseModel):
-    per_strategy: list[StrategyRow]
-    feedback_by_attempt: list[FeedbackByAttempt]
-
-
 class LabelCount(BaseModel):
     label: str
     count: int
@@ -311,87 +283,6 @@ def overview(
         avg_reply_minutes=avg_reply,
         median_reply_minutes=median_reply,
     )
-
-
-# ---------------------------------------------------------------------------
-# Retry-strategy report (the core M2 thesis question)
-# ---------------------------------------------------------------------------
-
-_FEEDBACK_SIGNALS = [
-    "explicit_yes", "explicit_no",
-    "implicit_rephrase", "implicit_new_topic", "timeout",
-]
-
-
-@router.get("/strategies", response_model=StrategyReport)
-def strategies(
-    since: datetime | None = None,
-    until: datetime | None = None,
-    db: Session = Depends(get_db),
-):
-    start, end = _range(since, until)
-
-    # Per-strategy aggregates.
-    rows = (
-        db.query(
-            QAAttempt.retrieval_strategy,
-            func.count(QAAttempt.id),
-            func.sum(case((QAAttempt.was_fallback.is_(True), 1), else_=0)),
-            func.avg(QAAttempt.latency_ms),
-        )
-        .filter(_between(QAAttempt.created_at, start, end))
-        .group_by(QAAttempt.retrieval_strategy)
-        .all()
-    )
-
-    per_strategy: list[StrategyRow] = []
-    for strategy, attempts, fallback, avg_lat in rows:
-        signal_counts = dict(
-            db.query(QAAttempt.feedback_signal, func.count())
-            .filter(_between(QAAttempt.created_at, start, end))
-            .filter(QAAttempt.retrieval_strategy == strategy)
-            .group_by(QAAttempt.feedback_signal)
-            .all()
-        )
-        per_strategy.append(
-            StrategyRow(
-                strategy=strategy or "default",
-                attempts=int(attempts or 0),
-                fallback=int(fallback or 0),
-                fallback_rate=_safe_div(int(fallback or 0), int(attempts or 0)),
-                explicit_yes=int(signal_counts.get("explicit_yes", 0)),
-                explicit_no=int(signal_counts.get("explicit_no", 0)),
-                implicit_rephrase=int(signal_counts.get("implicit_rephrase", 0)),
-                implicit_new_topic=int(signal_counts.get("implicit_new_topic", 0)),
-                timeout=int(signal_counts.get("timeout", 0)),
-                avg_latency_ms=round(float(avg_lat), 2) if avg_lat is not None else None,
-            )
-        )
-    per_strategy.sort(key=lambda r: r.attempts, reverse=True)
-
-    # Feedback distribution per attempt number (1, 2, 3).
-    fb_by_attempt: list[FeedbackByAttempt] = []
-    for n in (1, 2, 3):
-        counts = dict(
-            db.query(QAAttempt.feedback_signal, func.count())
-            .filter(_between(QAAttempt.created_at, start, end))
-            .filter(QAAttempt.attempt_number == n)
-            .group_by(QAAttempt.feedback_signal)
-            .all()
-        )
-        fb_by_attempt.append(
-            FeedbackByAttempt(
-                attempt_number=n,
-                explicit_yes=int(counts.get("explicit_yes", 0)),
-                explicit_no=int(counts.get("explicit_no", 0)),
-                implicit_rephrase=int(counts.get("implicit_rephrase", 0)),
-                implicit_new_topic=int(counts.get("implicit_new_topic", 0)),
-                timeout=int(counts.get("timeout", 0)),
-                no_signal=int(counts.get(None, 0)),
-            )
-        )
-
-    return StrategyReport(per_strategy=per_strategy, feedback_by_attempt=fb_by_attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +702,7 @@ def topics(
 # ---------------------------------------------------------------------------
 
 ExportSection = Literal[
-    "overview", "strategies", "escalations", "documents", "timeseries", "topics"
+    "overview", "escalations", "documents", "timeseries", "topics"
 ]
 
 
@@ -839,14 +730,6 @@ def export_csv(
     if section == "overview":
         data = overview(since, until, db).model_dump()
         return _csv_response([data], "overview.csv")
-
-    if section == "strategies":
-        rep = strategies(since, until, db)
-        return _csv_response(
-            [r.model_dump() for r in rep.per_strategy]
-            + [r.model_dump() for r in rep.feedback_by_attempt],
-            "strategies.csv",
-        )
 
     if section == "escalations":
         rep = escalations_report(since, until, db)

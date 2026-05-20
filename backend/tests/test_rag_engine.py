@@ -49,16 +49,6 @@ def test_ask_marks_fallback_when_llm_repeats_fallback_phrase():
     assert resp.was_fallback is True
 
 
-def test_ask_forwards_strategy_to_retrieve():
-    with patch("rag_engine.retrieve", return_value=[]) as retr, \
-         patch("rag_engine.generate"):
-        resp = ask("x", strategy="query_rewrite")
-
-    retr.assert_called_once()
-    assert retr.call_args.kwargs["strategy"] == "query_rewrite"
-    assert resp.strategy == "query_rewrite"
-
-
 def test_ask_passes_category_to_retrieve():
     with patch("rag_engine.retrieve", return_value=[]) as retr, \
          patch("rag_engine.generate"):
@@ -98,10 +88,3 @@ def test_ask_prepends_prior_question_into_retrieval_only():
     assert "quando vai ser a ADA?" not in captured["prompt"]
 
 
-def test_ask_default_strategy_is_default():
-    with patch("rag_engine.retrieve", return_value=[]) as retr, \
-         patch("rag_engine.generate"):
-        resp = ask("x")
-
-    assert retr.call_args.kwargs["strategy"] == "default"
-    assert resp.strategy == "default"

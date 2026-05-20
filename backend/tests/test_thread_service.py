@@ -76,7 +76,6 @@ def _make_escalation(
         attempt_number=1,
         question="q",
         answer="a",
-        retrieval_strategy="default",
         was_fallback=False,
     )
     db.add(att)

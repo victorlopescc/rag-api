@@ -4,9 +4,8 @@ Quando o bot esgota as 3 tentativas sem resolver a dúvida, o webhook
 chama :func:`create_escalation`, que:
 
 1. Resume as tentativas usando o LLM (Ollama), destacando a pergunta
-   original, as estratégias de retrieval usadas e o que o bot respondeu
-   de errado — material cru para o coordenador agir e para a análise
-   do TCC.
+   original e o que o bot respondeu de errado — material cru para o
+   coordenador agir e para a análise do TCC.
 2. Cria a linha em ``escalations`` vinculada à ``QASession``.
 3. Marca a sessão como ``escalated`` (se ainda não estiver).
 
@@ -43,7 +42,7 @@ _SUMMARY_PROMPT = (
 def _render_attempts(attempts: list[QAAttempt]) -> str:
     lines: list[str] = []
     for a in attempts:
-        lines.append(f"[Tentativa {a.attempt_number} — estratégia={a.retrieval_strategy}]")
+        lines.append(f"[Tentativa {a.attempt_number}]")
         lines.append(f"Pergunta do aluno: {a.question}")
         lines.append(f"Resposta do bot:   {a.answer}")
         if a.feedback_signal:
