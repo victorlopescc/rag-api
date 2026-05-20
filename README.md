@@ -224,8 +224,7 @@ backend/
 │   ├── session_manager.py   # Ciclo de vida da QASession
 │   ├── thread_service.py    # Live thread aluno↔coordenador
 │   └── whatsapp.py          # Textos fixos e helpers
-├── scripts/                 # Scripts auxiliares (reindex)
-└── tests/                   # Suite de testes (pytest)
+└── scripts/                 # Scripts auxiliares (reindex)
 
 infra/
 ├── docker-compose.yml       # PostgreSQL, MongoDB, Redis, ChromaDB, Evolution
@@ -234,17 +233,6 @@ infra/
 ├── reset_all.sh             # Apaga tudo e sobe de novo
 └── configure_evolution_webhook.sh
 ```
-
----
-
-## Rodando os testes
-
-```bash
-cd backend && python -m pytest -q
-```
-
-Testes usam SQLite in-memory para os fluxos que envolvem persistência;
-Ollama, Evolution API e Chroma são mockados.
 
 ---
 
