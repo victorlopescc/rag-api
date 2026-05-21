@@ -13,14 +13,19 @@ python-docx
 
 # RAG / Embeddings
 chromadb
-# Reranker cross-encoder. Reordena os top-K do retrieval por relevância
-# semântica fina. Roda 100% local em CPU.
-sentence-transformers
 # Retrieval híbrido (lexical/BM25 + denso). Pega match literal de
 # nomes/siglas que o embedding semântico às vezes solta.
 rank-bm25
+# Histórico: ``sentence-transformers`` rodava o cross-encoder de
+# reranker local. Substituído por LLM-as-reranker (Gemini via litellm)
+# — sem mais dependência pesada de torch.
 
-# HTTP client (para chamar Ollama)
+# LLM (geração + embeddings). Abstração via litellm permite trocar de
+# provider mudando só o nome do model — hoje Gemini Flash, amanhã pode
+# ser Groq/OpenAI/Claude sem alterar código.
+litellm
+
+# HTTP client (resto da app — Evolution, Chroma, etc.)
 httpx
 
 # Mongo (para ler ACKs da Evolution API e resolver LID → phone)

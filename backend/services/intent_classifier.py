@@ -4,13 +4,13 @@ Duas camadas:
 
 1. Fast-path (regex) em ``classify_fast`` — herdado do session_manager
    (apenas "yes" é detectado aqui de forma barata).
-2. LLM (Ollama) em ``classify_with_llm`` — dada a última pergunta
-   e resposta do bot + a nova mensagem do aluno, decide entre
+2. LLM em ``classify_with_llm`` — dada a última pergunta e resposta
+   do bot + a nova mensagem do aluno, decide entre
    ``yes | no | rephrase | new_topic | unclear``.
 
 A fachada ``classify`` combina as duas: tenta o fast-path; se for
 inconclusivo e houver contexto anterior, cai no LLM. Nunca levanta —
-em caso de erro no Ollama devolve ``unclear`` e loga.
+em caso de erro na API devolve ``unclear`` e loga.
 
 Ser robusto importa mais do que ser preciso: o custo de um
 ``new_topic`` confundido com ``rephrase`` é só "gasta uma tentativa
@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-import httpx
+import litellm
 
 from config import settings
 from services.session_manager import classify_fast
@@ -80,18 +80,8 @@ def _build_prompt(prior: Prior, new_message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Chamada ao Ollama
+# Chamada à LLM (via litellm — provider configurável)
 # ---------------------------------------------------------------------------
-
-_client: httpx.Client | None = None
-
-
-def _get_client() -> httpx.Client:
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.Client(base_url=settings.ollama_base_url, timeout=30.0)
-    return _client
-
 
 _JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
@@ -126,20 +116,37 @@ def _parse_intent(raw: str) -> Intent:
 
 
 def classify_with_llm(prior: Prior, new_message: str) -> Intent:
-    """Chama Ollama e devolve a intenção. ``unclear`` em caso de erro."""
+    """Chama a LLM externa e devolve a intenção. ``unclear`` em erro.
+
+    Idealmente seria ``temperature=0`` pra ser determinístico — mesma
+    entrada, mesma classificação. Mas a família Gemini 3 exige
+    ``temperature ~= 1.0`` (ver nota em ``pipeline.llm._temperature_for``),
+    então usamos o mesmo helper aqui. A variabilidade que isso introduz
+    é limitada pela escolha enxuta de intents válidas + prompt curto.
+
+    NÃO aplicamos o pós-processamento de ``pipeline.llm.generate`` aqui
+    porque o output é JSON estruturado e as regexes de limpeza removeriam
+    as chaves.
+    """
+    from pipeline.llm import _extra_kwargs_for, _temperature_for
     try:
-        resp = _get_client().post(
-            "/api/generate",
-            json={
-                "model": settings.ollama_llm_model,
-                "prompt": _build_prompt(prior, new_message),
-                "stream": False,
-                # Determinístico — queremos a mesma classificação para a mesma entrada.
-                "options": {"temperature": 0.0},
-            },
+        response = litellm.completion(
+            model=settings.llm_model,
+            messages=[
+                {"role": "user", "content": _build_prompt(prior, new_message)},
+            ],
+            temperature=_temperature_for(settings.llm_model),
+            # 256 tokens com thinking desligado é folgado pro JSON
+            # curto que esperamos ({"intent": "yes"}). Antes era 80, mas
+            # Gemini 3 podia consumir todo o orçamento em thinking e
+            # devolver string vazia → classifier caía em ``unclear``.
+            max_tokens=256,
+            api_key=settings.gemini_api_key,
+            timeout=30.0,
+            **_extra_kwargs_for(settings.llm_model),
         )
-        resp.raise_for_status()
-        return _parse_intent(resp.json().get("response", ""))
+        raw = (response.choices[0].message.content or "")
+        return _parse_intent(raw)
     except Exception as e:  # pragma: no cover - log path
         logger.warning(f"Intent classifier falhou: {e}")
         return "unclear"

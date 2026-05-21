@@ -72,16 +72,23 @@ def _split_recursive(text: str, separators: list[str], size: int) -> list[str]:
 
 
 def _apply_overlap(chunks: list[str], overlap: int, size: int) -> list[str]:
-    """Adiciona overlap entre chunks consecutivos, garantindo que o
-    resultado não exceda ``size`` significativamente."""
+    """Adiciona overlap (tail do chunk anterior) prepended em cada chunk.
+
+    NÃO truncamos o resultado em ``size`` — antes truncávamos e isso
+    apagava o FINAL do chunk, perdendo info crítica. Caso real visto:
+    o ``ID: AEDs2.`` no fim da linha tabular sumia, e perguntas tipo
+    "qual o pré-requisito de AEDs2?" caíam em fallback eterno.
+
+    O size é soft em TODO o pipeline (o ``_split_recursive`` também
+    pode ultrapassar quando não tem separador disponível). Manter
+    chunks com 100-200 chars a mais que o size é trade-off aceitável
+    pra não destruir contexto.
+    """
     if overlap <= 0 or len(chunks) <= 1:
         return chunks
     safe_overlap = min(overlap, max(1, size // 4))
     result = [chunks[0]]
     for chunk in chunks[1:]:
         tail = result[-1][-safe_overlap:]
-        merged = tail + " " + chunk
-        if len(merged) > size:
-            merged = merged[:size]
-        result.append(merged)
+        result.append(tail + " " + chunk)
     return result

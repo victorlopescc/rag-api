@@ -16,10 +16,11 @@
 #   WORKERS=2 bash infra/run_backend.sh        # quantos quiser
 #   API_PORT=9000 bash infra/run_backend.sh    # outra porta
 #
-# Por que 4 workers e não 8?
-# O Ollama processa 1 generate por vez (gargalo de GPU/CPU). Mais workers
-# que isso só fariam fila no Ollama. Em uma máquina com mais GPU/CPU pra
-# rodar mais Ollama em paralelo, aumente.
+# Por que 4 workers?
+# Com a LLM em API externa (Gemini), o gargalo deixou de ser GPU local
+# e virou rate limit / latência de rede. 4 workers cabem com folga no
+# free tier do Gemini (15 RPM em chat, 1500 RPM em embeddings) sem
+# travar o restante das rotas. Aumente se for pagar tier maior.
 # =============================================================================
 set -euo pipefail
 

@@ -44,17 +44,6 @@ YES_ACK = (
     "*/coordenador*."
 )
 
-# Texto enviado depois da 3ª (e última) tentativa do RAG. Pede uma
-# decisão final do aluno em formato 1/2/3. Substitui a poll que a
-# Evolution não consegue entregar de volta.
-POST_ATTEMPT3_PROMPT = (
-    "Essa foi minha última tentativa! 🎓\n\n"
-    "Como foi pra você? Responda com:\n"
-    "*1* — Resolveu totalmente\n"
-    "*2* — Resolveu parcialmente\n"
-    "*3* — Não resolveu, quero falar com o coordenador"
-)
-
 # Mensagem ao aluno quando a 4ª mensagem dispara escalação automática.
 ESCALATION_NOTICE = (
     "Vou encaminhar sua dúvida ao coordenador. Ele responde por aqui "
@@ -158,7 +147,7 @@ def _log_query(db: Session, student: Student, question: str, result) -> None:
         question=question,
         answer=result.answer,
         chunks_used=chunk_ids,
-        model_used=settings.ollama_llm_model,
+        model_used=settings.llm_model,
         latency_ms=result.latency_ms,
         was_fallback=result.was_fallback,
     ))
@@ -357,7 +346,7 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
 
     # 1.6. Triagem rápida (sem RAG, sem LLM). Saudações, trivialidades e
     # comandos /ajuda /cancelar têm respostas pré-formatadas. Evita
-    # gastar 25s do Ollama em mensagens tipo "oi". Confirmações ("obrigado")
+    # gastar uma chamada de LLM em mensagens tipo "oi". Confirmações ("obrigado")
     # são deixadas passar pra session_manager.plan_interaction tratar.
     kind = message_triage.classify(msg["text"])
     if kind == "help":
@@ -438,8 +427,8 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
     # `prior_question` mantém o tópico no retrieval em follow-ups
     # ("quanto tempo tem a prova?" depois de "quando vai ser a ADA?").
     #
-    # ``ask()`` é síncrono e leva 15-30s (HTTP síncrono pro Ollama +
-    # Chroma). Chamar direto em rota async travaria o event loop e
+    # ``ask()`` é síncrono e leva alguns segundos (HTTP síncrono pra
+    # LLM externa + Chroma). Chamar direto em rota async travaria o event loop e
     # bloquearia TODOS os outros requests deste worker (incluindo GETs
     # do admin). ``run_in_threadpool`` joga a chamada numa thread auxiliar
     # e libera o loop pra atender requests concorrentes.
@@ -475,17 +464,13 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
     except Exception as e:
         logger.error(f"Erro ao enviar mensagem: {e}")
 
-    # Após a 3ª tentativa, em vez de esperar uma 4ª mensagem
-    # de frustração ("ainda não respondeu"), forçamos uma decisão final:
-    # texto bonito pedindo 1/2/3. O voto é processado pelo handler de
-    # text vote (que olha a última sessão recente do aluno).
-    if plan.attempt_number == 3:
-        try:
-            await evolution_client.send_text(
-                student.phone_number, POST_ATTEMPT3_PROMPT,
-            )
-        except Exception as e:
-            logger.error(f"Erro enviando opções pós-3a: {e}")
+    # NOTA HISTÓRICA: aqui antes saía uma segunda mensagem
+    # ``POST_ATTEMPT3_PROMPT`` quando ``plan.attempt_number == 3``,
+    # forçando uma decisão final. Hoje o ``FEEDBACK_PROMPT_SUFFIX``
+    # (anexado em TODA resposta acima) já pede 1/2/3, então a 2ª
+    # mensagem virou redundância visível ao aluno como "poll duplicada".
+    # Se aluno responder "2" depois da attempt 3, a próxima mensagem dele
+    # (>3) cai direto na escalação automática em plan_interaction.
 
     return {"status": "ok"}
 

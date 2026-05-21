@@ -3,7 +3,7 @@
 Quando o bot esgota as 3 tentativas sem resolver a dúvida, o webhook
 chama :func:`create_escalation`, que:
 
-1. Resume as tentativas usando o LLM (Ollama), destacando a pergunta
+1. Resume as tentativas usando o LLM, destacando a pergunta
    original e o que o bot respondeu de errado — material cru para o
    coordenador agir e para a análise do TCC.
 2. Cria a linha em ``escalations`` vinculada à ``QASession``.

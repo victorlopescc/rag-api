@@ -1,11 +1,20 @@
-"""Chama o modelo LLM no Ollama e retorna a resposta como string."""
-import re
+"""Geração de texto via LiteLLM.
 
-import httpx
+Provider e modelo são definidos em ``settings.llm_model`` (padrão atual:
+``gemini/gemini-2.5-flash``). Pra trocar de provider, basta mudar a
+string + setar a API key correspondente — o resto do código nem fica
+sabendo.
+"""
+import logging
+import re
+import time
+
+import litellm
+from litellm.exceptions import APIError, RateLimitError, Timeout
 
 from config import settings
 
-_client: httpx.Client | None = None
+logger = logging.getLogger(__name__)
 
 # Mensagem usada quando o pós-processamento poda toda a resposta a ponto de
 # sobrar lixo. Duplicada aqui de pipeline.prompt_builder pra evitar import
@@ -13,10 +22,43 @@ _client: httpx.Client | None = None
 FALLBACK_PLACEHOLDER = "Não encontrei essa informação nos documentos disponíveis."
 
 
+def _temperature_for(model: str) -> float:
+    """Define a temperatura por família de modelo.
+
+    A família Gemini 3 EXIGE ``temperature ~= 1.0``. O próprio LiteLLM avisa:
+    "Setting temperature < 1.0 for Gemini 3 models can cause infinite loops,
+    degraded reasoning performance, and failure on complex tasks."
+
+    Modelos antigos (Gemini 2.5, Qwen, Claude, OpenAI) funcionam melhor
+    com temperatura baixa pra RAG factual — alucinação aqui vai direto
+    pro WhatsApp do aluno.
+    """
+    if "gemini-3" in model:
+        return 1.0
+    return 0.1
+
+
+def _extra_kwargs_for(model: str) -> dict:
+    """Args extras por família de modelo (passados ao litellm.completion).
+
+    Gemini 3 vem com "thinking tokens" ligados por default — o modelo
+    pensa internamente antes de responder, e ESSE pensamento consome
+    o orçamento de ``max_tokens``. Em testes vimos casos onde 1024 tokens
+    viraram 540 de pensamento + 122 de texto visível, cortando a resposta.
+
+    Pra RAG factual, raciocínio extenso não ajuda — queremos extração
+    direta dos chunks. Setamos ``reasoning_effort=disable`` pra zerar
+    o overhead de thinking e liberar todo o orçamento pro texto.
+    """
+    if "gemini-3" in model:
+        return {"reasoning_effort": "disable"}
+    return {}
+
+
 # Remove blocos de caracteres CJK (chinês/japonês/coreano), cirílico,
-# árabe, etc. Vimos qwen2.5:14b ocasionalmente vazar tokens em chinês
-# no meio de respostas em PT — provavelmente "language drift" pós-stop.
-# Mantemos apenas latim, dígitos, pontuação e símbolos comuns.
+# árabe, etc. Modelos multilíngues ocasionalmente vazam tokens em outros
+# idiomas no meio de respostas em PT (mais comum no Qwen, raríssimo no
+# Gemini — mantemos o filtro como salvaguarda barata).
 _NON_LATIN_RE = re.compile(
     r"[　-〿぀-ゟ゠-ヿ㐀-䶿"
     r"一-鿿＀-￯Ѐ-ӿ؀-ۿऀ-ॿ]+"
@@ -68,80 +110,57 @@ _META_PHRASE_RE = re.compile(
 )
 
 
-def _get_client() -> httpx.Client:
-    global _client
-    if _client is None or _client.is_closed:
-        # Timeout p/ qwen2.5:7b — cabe na GPU e responde em ~3-8s.
-        # 90s dá folga pra primeiro request (cold start do Ollama) e
-        # pra prompts longos sem deixar o usuário pendurado.
-        _client = httpx.Client(base_url=settings.ollama_base_url, timeout=90.0)
-    return _client
-
-
 def generate(prompt: str) -> str:
-    """Envia o prompt para o Ollama e retorna o texto gerado.
+    """Envia o prompt para a LLM externa e retorna o texto pós-processado.
 
-    Usa parâmetros conservadores (temperature baixa) porque este é um RAG
+    Usa parâmetros conservadores (``temperature=0.1``) porque este é um RAG
     factual — alucinação aqui vai direto pro WhatsApp do aluno.
 
-    Faz até 2 retries com backoff em erro 5xx do Ollama. Com qwen2.5:7b
-    cabendo na VRAM da RTX 4050 (6GB), os erros 5xx ficaram raros —
-    eram comuns no qwen14b por OOM/CUDA. Mantemos o retry como
-    salvaguarda mas com backoff curto pra não pendurar 3min em falhas.
+    Faz até 2 retries com backoff em erros transitórios da API (5xx,
+    rate limit, timeout). LiteLLM normaliza esses erros entre providers.
     """
-    import time
-
-    payload = {
-        "model": settings.ollama_llm_model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,       # factual, quase determinístico
-            "top_p": 0.9,
-            "repeat_penalty": 1.1,    # evita bullets/frases repetidas
-            # qwen2.5:7b-q4_K_M (~4.4GB) + KV cache + ativações precisam
-            # caber em ~5.3GB úteis da RTX 4050 (6GB total - ~800MB que
-            # Windows/Chrome reservam). 4096 dá folga e cobre 10 chunks
-            # de 500 tokens + system prompt sem truncar.
-            "num_ctx": 4096,
-            "num_predict": 320,       # respostas curtas mas com folga
-            "stop": ["PERGUNTA:", "CONTEXTO:", "\n---"],
-        },
-    }
-    client = _get_client()
     last_err: Exception | None = None
+    text: str = ""
     for attempt in range(3):
         try:
-            response = client.post("/api/generate", json=payload)
-            if response.status_code >= 500:
-                body = (response.text or "")[:300]
-                logger = __import__("logging").getLogger(__name__)
-                logger.warning(
-                    f"Ollama {response.status_code} em generate "
-                    f"(tentativa {attempt + 1}/3). Body: {body}"
-                )
-                response.raise_for_status()
-            response.raise_for_status()
+            response = litellm.completion(
+                model=settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=_temperature_for(settings.llm_model),
+                top_p=0.9,
+                # 2048 tokens (~6kB de texto em PT-BR). Cobre respostas
+                # longas (listas de disciplinas, resumos de escalação)
+                # com margem confortável. O Gemini é mais "tagarela" que
+                # o Qwen e a família 3 tinha thinking que consumia
+                # orçamento — desligamos via ``_extra_kwargs_for``.
+                max_tokens=2048,
+                api_key=settings.gemini_api_key,
+                timeout=90.0,
+                **_extra_kwargs_for(settings.llm_model),
+            )
+            text = (response.choices[0].message.content or "").strip()
             break
-        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        except (APIError, RateLimitError, Timeout) as e:
             last_err = e
-            # Backoff curto: 1s, 2s. Total worst case ~3s + tempos
-            # de request, bem longe dos 3min do setup anterior.
+            logger.warning(
+                f"LLM erro (tentativa {attempt + 1}/3): "
+                f"{type(e).__name__}: {e}"
+            )
             if attempt < 2:
+                # Backoff curto: 1s, 2s. Total worst case ~3s + tempos
+                # de request.
                 time.sleep(1.0 * (attempt + 1))
                 continue
             raise
-    text = response.json()["response"].strip()
+
     # Remove preâmbulos do tipo "Com base no contexto, ..." que o modelo
     # insiste em gerar mesmo quando o system prompt proíbe.
     text = _PREAMBLE_RE.sub("", text).strip()
     # Remove meta-comentários entre parênteses (ambiguidade, suposições, etc.)
-    # — proibidos pelo prompt mas o modelo às vezes ainda gera.
     text = _META_PAREN_RE.sub(" ", text).strip()
     # Remove frases inteiras de hedge ("Não há resposta específica..." etc.)
     text = _META_PHRASE_RE.sub("", text).strip()
-    # Remove tokens em outros idiomas (CJK, cirílico, etc.) que o
-    # qwen2.5:14b ocasionalmente vaza no meio de respostas em PT.
+    # Remove tokens em outros idiomas (CJK, cirílico, etc.) — salvaguarda.
     text = _NON_LATIN_RE.sub("", text).strip()
     # Limpa espaços duplicados que possam ter sobrado.
     text = re.sub(r"[ \t]{2,}", " ", text)

@@ -1,104 +1,129 @@
-"""Cross-encoder reranker — reordena os top-K do retrieval por relevância
-semântica fina (query↔chunk).
+"""LLM-as-reranker — usa o próprio Gemini 3 Flash pra ranquear chunks por
+relevância à query.
 
-Por que existe
---------------
-Embeddings densos (nomic-embed-text) ranqueiam por similaridade média do
-significado. O problema: cabeçalhos e intros dos documentos têm
-similaridade alta com QUASE qualquer query do mesmo domínio, soterrando
-chunks que LITERALMENTE respondem a pergunta. Um cross-encoder olha
-query+chunk juntos e atribui um score calibrado de relevância — sem os
-patterns hardcoded que tínhamos antes (boost lexical, expansões
-conceituais), o que torna o sistema doc-agnóstico.
+Por que existe (e por que NÃO é mais cross-encoder local)
+---------------------------------------------------------
+Antes: ``cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`` rodando local via
+``sentence-transformers``. Funcionava razoavelmente em texto natural,
+mas tinha 2 problemas:
 
-Privacidade
------------
-O modelo baixa do HuggingFace UMA vez na instalação e roda 100% offline
-depois. Sem chamada de API externa em runtime. Cabe a constraint de
-privacidade do sistema.
+1. **Formato tabular confunde**: chunks tipo
+   ``- Per: 2; Disciplina: AEDs2; CH: 120; ...`` recebiam score baixo
+   porque o modelo foi treinado em prosa, não em campos chave-valor.
+   Vimos casos onde o chunk LITERALMENTE correto era cortado.
+2. **500MB de RAM ocupados pra cada worker uvicorn** + ~120MB no disco
+   pelo modelo + dependência pesada (``torch``, ``sentence-transformers``).
 
-Custo
------
-mmarco-mMiniLMv2-L12-H384-v1: ~120MB no disco, ~500MB RAM em runtime,
-~80-150ms pra ranquear 25 pares em CPU. No nosso budget de 16GB com
-qwen14b (~10-11GB) sobra folga.
+Hoje: o Gemini 3 Flash já é o LLM principal do RAG. Ele é muito mais
+capaz de avaliar relevância semântica que o mmarco, entende formato
+tabular nativamente, e custa ~$0.001 por chamada (alguns milésimos de
+real). Adicionar uma chamada extra pra reranking ficou trivial.
+
+Como funciona
+-------------
+1. Recebe os top-N chunks do retrieval híbrido (N ~= ``reranker_input_k``).
+2. Manda pro Gemini um prompt: "Aqui está uma pergunta e N trechos;
+   retorne JSON com os índices ordenados por relevância, com score 0-10".
+3. Parseia o JSON, aplica ``min_score``, retorna top_k.
+4. Em qualquer falha (JSON inválido, timeout, etc.), faz fallback
+   gracioso devolvendo os chunks na ordem original — pra que o pipeline
+   nunca derrube uma query por causa do reranker.
+
+Custo & latência
+----------------
+Por query: ~3-5k tokens de input + ~300 de output. Em Gemini 3 Flash:
+~$0.001/call e ~0.8-1.5s de latência adicional. Aceitável pra UX de
+WhatsApp.
 """
 from __future__ import annotations
 
+import json
 import logging
-import math
-import os
-import threading
-from typing import Any
+import re
 
-# CRÍTICO: precisa vir ANTES de qualquer import que carregue torch.
-# Sem isso, ``torch`` importa o runtime CUDA mesmo configurando
-# ``device="cpu"`` no CrossEncoder, e o runtime sozinho reserva
-# 200-500MB de VRAM só do contexto CUDA. Em GPUs apertadas (ex.: RTX
-# 4050 com 6GB e Windows + Chrome consumindo ~1GB de baseline), esses
-# 500MB são suficientes pra fazer o Ollama crashar com "llama runner
-# process has terminated: CUDA error" ao carregar o LLM.
-# Setar a env var pra string vazia diz ao torch "não vejo nenhuma
-# GPU" — torch não inicializa CUDA, não reserva VRAM, e o reranker
-# roda em CPU (que é o que queríamos de qualquer jeito).
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+import litellm
+
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Carregamento do modelo é caro (~2-5s no primeiro uso). Mantemos
-# um singleton com lock pra inicialização thread-safe — uvicorn com
-# múltiplos workers só baixa/carrega uma vez por worker.
-_model: Any = None
-_model_lock = threading.Lock()
+
+# Limita o tamanho do preview de cada chunk no prompt. Mais que isso
+# infla o prompt sem proporcionalmente melhorar a decisão do reranker
+# (a parte mais relevante do chunk geralmente é o início ou centro,
+# raramente os últimos 300 chars).
+_CHUNK_PREVIEW_CHARS = 500
 
 
-def _load_model() -> Any:
-    global _model
-    if _model is not None:
-        return _model
-    with _model_lock:
-        if _model is not None:  # double-checked locking
-            return _model
-        # Import preguiçoso pra que o módulo seja importável mesmo sem
-        # sentence-transformers instalado (testes que mockam não pagam
-        # a dep). Se não tem, propaga o ImportError com contexto.
+_PROMPT_TEMPLATE = """Avalie a relevância de cada trecho para responder a pergunta.
+
+PERGUNTA:
+{query}
+
+TRECHOS:
+{chunks_block}
+
+Atribua a CADA trecho uma nota de 0 a 10:
+- 0-2: irrelevante
+- 3-5: pouco relevante (toca no assunto mas não responde)
+- 6-8: relevante (contém a informação)
+- 9-10: altamente relevante (contém a resposta direta)
+
+Não invente, não infira — avalie só pela presença de informação útil.
+
+Responda APENAS um JSON neste formato exato, sem comentários ou markdown:
+{{"ranking": [{{"id": 0, "score": 9}}, {{"id": 3, "score": 7}}, ...]}}
+
+Inclua TODOS os trechos no ranking. Ordene do mais relevante ao menos."""
+
+
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _build_prompt(query: str, chunks: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(chunks):
+        preview = (c.get("content") or "")[:_CHUNK_PREVIEW_CHARS]
+        # Sem newlines internos pra preservar formato do prompt;
+        # substituímos por " | " pra manter legibilidade.
+        preview = preview.replace("\n", " | ")
+        lines.append(f"[{i}] {preview}")
+    return _PROMPT_TEMPLATE.format(query=query, chunks_block="\n\n".join(lines))
+
+
+def _parse_ranking(raw: str, expected_n: int) -> list[tuple[int, float]] | None:
+    """Extrai ``[(id, score_0_to_1), ...]`` do JSON do LLM. None em erro.
+
+    Tolerante a ruído ao redor (markdown, prefixos) — pega o primeiro
+    bloco ``{...}`` válido.
+    """
+    m = _JSON_BLOCK_RE.search(raw or "")
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    ranking = obj.get("ranking")
+    if not isinstance(ranking, list):
+        return None
+
+    out: list[tuple[int, float]] = []
+    for item in ranking:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id")
+        score = item.get("score")
+        if not isinstance(idx, int) or idx < 0 or idx >= expected_n:
+            continue
         try:
-            from sentence_transformers import CrossEncoder
-        except ImportError as e:  # pragma: no cover
-            raise ImportError(
-                "sentence-transformers não está instalado. "
-                "Rode `pip install sentence-transformers` ou desligue o "
-                "reranker via ENABLE_RERANKER=false no .env."
-            ) from e
-
-        from config import settings
-        logger.info(
-            f"Carregando cross-encoder: {settings.reranker_model} "
-            f"(device={settings.reranker_device})"
-        )
-        # CRÍTICO: forçamos device explicitamente. Default do
-        # sentence-transformers é CUDA se disponível, o que faz o
-        # reranker BRIGAR por VRAM com o qwen14b já carregado no Ollama
-        # e gerar "CUDA error" / OOM no LLM. Em CPU, o reranker roda
-        # em ~80-150ms por batch de 25 (aceitável) e não toca a GPU.
-        _model = CrossEncoder(
-            settings.reranker_model,
-            max_length=512,
-            device=settings.reranker_device,
-        )
-        logger.info("Cross-encoder carregado.")
-        return _model
-
-
-def _sigmoid(x: float) -> float:
-    """Logit → probabilidade [0,1]. Trabalhamos em probabilidades pra
-    que o threshold downstream tenha sentido absoluto (0.5 = "modelo
-    está em dúvida"; <0.05 = "claramente irrelevante")."""
-    # Clamp pra evitar overflow em logits muito grandes.
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
+            s = float(score)
+        except (TypeError, ValueError):
+            continue
+        # Normaliza score 0-10 → 0-1. Clamp defensivo.
+        s_norm = max(0.0, min(10.0, s)) / 10.0
+        out.append((idx, s_norm))
+    return out if out else None
 
 
 def rerank(
@@ -110,48 +135,96 @@ def rerank(
 ) -> list[dict]:
     """Reordena ``chunks`` por relevância à ``query`` e devolve os top_k.
 
-    Cada chunk de saída tem dois campos novos preservados:
-      - ``rerank_score``: probabilidade [0,1] da relevância (sigmoid do logit).
-      - ``embed_score``:  o score original do embedding (preservado pra debug).
+    Cada chunk de saída tem dois campos novos:
+      - ``rerank_score``: probabilidade [0,1] de relevância (do LLM).
+      - ``embed_score``:  o score original do RRF (preservado pra debug).
 
-    O campo ``score`` passa a refletir o ``rerank_score``, pra que o
-    downstream (filtros e ordenação) opere sobre a sinal mais forte.
+    O campo ``score`` passa a refletir ``rerank_score``.
 
     ``min_score`` filtra chunks abaixo desse limiar antes de cortar em top_k.
     Default 0.0 = sem filtro (decisão fica com o caller).
+
+    Em caso de falha (LLM timeout, JSON inválido, etc.), devolve os
+    chunks na ordem original (limitado a top_k) — fail-soft pra não
+    quebrar a query do aluno.
     """
     if not chunks:
         return []
-    model = _load_model()
-    pairs = [(query, (c.get("content") or "")) for c in chunks]
-    raw_scores = model.predict(pairs)  # numpy array (real) ou list (mock)
-    if hasattr(raw_scores, "tolist"):
-        raw_scores = raw_scores.tolist()
+
+    # Importa aqui pra quebrar dependência circular potencial e respeitar
+    # o helper que sabe disable thinking em Gemini 3.
+    from pipeline.llm import _extra_kwargs_for, _temperature_for
+
+    prompt = _build_prompt(query, chunks)
+    try:
+        response = litellm.completion(
+            model=settings.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=_temperature_for(settings.llm_model),
+            max_tokens=512,
+            api_key=settings.gemini_api_key,
+            timeout=30.0,
+            **_extra_kwargs_for(settings.llm_model),
+        )
+        raw = response.choices[0].message.content or ""
+    except Exception as e:
+        logger.warning(f"LLM rerank falhou ({type(e).__name__}: {e}); usando ordem original")
+        return _fallback_order(chunks, top_k)
+
+    ranking = _parse_ranking(raw, expected_n=len(chunks))
+    if ranking is None:
+        logger.warning(f"LLM rerank devolveu JSON inválido; usando ordem original. Raw: {raw[:200]!r}")
+        return _fallback_order(chunks, top_k)
+
     enriched: list[dict] = []
-    for c, logit in zip(chunks, raw_scores):
-        prob = _sigmoid(float(logit))
-        if prob < min_score:
+    seen_ids: set[int] = set()
+    for idx, score in ranking:
+        if idx in seen_ids:
             continue
+        seen_ids.add(idx)
+        if score < min_score:
+            continue
+        c = chunks[idx]
         enriched.append({
             **c,
             "embed_score": c.get("score"),
-            "rerank_score": prob,
-            "score": prob,
+            "rerank_score": score,
+            "score": score,
         })
+
+    # Garantia defensiva: se o LLM ignorou alguns chunks, anexa eles ao
+    # final com score 0. Evita perder candidatos só porque o reranker
+    # foi preguiçoso. Eles ficam atrás dos chunks ranqueados.
+    if len(seen_ids) < len(chunks):
+        for i, c in enumerate(chunks):
+            if i not in seen_ids:
+                enriched.append({
+                    **c,
+                    "embed_score": c.get("score"),
+                    "rerank_score": 0.0,
+                    "score": 0.0,
+                })
+
     enriched.sort(key=lambda x: x["rerank_score"], reverse=True)
     return enriched[:top_k]
 
 
-def warmup() -> None:
-    """Força o load do modelo no startup (evita primeira request lenta).
+def _fallback_order(chunks: list[dict], top_k: int) -> list[dict]:
+    """Mantém a ordem do retrieval híbrido quando o LLM falha. Preserva
+    o score original e marca ``rerank_score=None`` pra deixar claro no
+    log/debug que o reranker foi pulado nesta query."""
+    out = []
+    for c in chunks[:top_k]:
+        out.append({
+            **c,
+            "embed_score": c.get("score"),
+            "rerank_score": None,
+        })
+    return out
 
-    Chamável idempotentemente. Se ``enable_reranker`` está OFF na config,
-    é no-op.
-    """
-    from config import settings
-    if not settings.enable_reranker:
-        return
-    try:
-        _load_model()
-    except Exception as e:  # pragma: no cover
-        logger.warning(f"Reranker warmup falhou (pipeline cai pro ranking sem rerank): {e}")
+
+def warmup() -> None:
+    """Antes carregava o cross-encoder local. Agora é no-op — não há
+    modelo pra inicializar. Mantemos a função pra preservar o contrato
+    do ``main.py`` (chamada de startup) sem precisar mexer no caller."""
+    return

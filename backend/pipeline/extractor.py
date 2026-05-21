@@ -98,7 +98,7 @@ def _extract_non_table_blocks(page, table_bboxes: list) -> str:
 
     Sem isso, o conteúdo da tabela apareceria duas vezes: uma fragmentada
     (como blocos de texto soltos) e outra estruturada (como sentenças
-    linha-a-linha). O par confunde o reranker.
+    linha-a-linha). O par dilui o sinal no retrieval.
     """
     blocks = page.get_text("blocks")
     if not blocks:
@@ -170,7 +170,12 @@ def _render_table_as_sentences(table) -> str:
         if pairs:
             sentences.append("- " + "; ".join(pairs) + ".")
 
-    return "\n".join(sentences)
+    # Une linhas com \n\n (e não \n) pra o chunker recursivo
+    # PRIORIZAR quebrar entre linhas da tabela. Antes ele podia cortar
+    # no meio de "Pré-Req: AEDs1; ID: AEDs2." perdendo a sigla AEDs2 —
+    # vi isso acontecer com a Grade Computação. Com \n\n o splitter
+    # mantém cada linha íntegra.
+    return "\n\n".join(sentences)
 
 
 def _extract_headers(rows: list) -> tuple[list[str], int]:

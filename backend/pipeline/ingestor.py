@@ -77,7 +77,7 @@ def ingest_document(
         # 3. Divide em chunks
         logger.info(f"[{doc_id}] Gerando chunks...")
         chunks_text = split_text(text)
-        # Filtra chunks vazios / whitespace-only — Ollama responde 500 neles
+        # Filtra chunks vazios / whitespace-only — API de embedding rejeita
         # e o lote inteiro vai pro lixo. Acontece em PDFs com cabeçalhos
         # repetidos / paginas só com imagem.
         before = len(chunks_text)
@@ -92,7 +92,7 @@ def ingest_document(
         logger.info(f"[{doc_id}] {len(chunks_text)} chunks gerados.")
 
         # 4. Gera embeddings (pode demorar para docs grandes)
-        logger.info(f"[{doc_id}] Gerando embeddings via Ollama...")
+        logger.info(f"[{doc_id}] Gerando embeddings...")
         embeddings = embed_batch(chunks_text)
 
         # 5. Prepara dados para ChromaDB e PostgreSQL

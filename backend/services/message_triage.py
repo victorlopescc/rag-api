@@ -1,6 +1,6 @@
 """Triagem rápida (regex/lookup) da mensagem do aluno antes do pipeline RAG.
 
-Antes de gastar uma chamada de 18–30s ao Ollama, identificamos mensagens que
+Antes de gastar uma chamada de LLM (latência + tokens), identificamos mensagens que
 claramente NÃO são perguntas factuais — saudações isoladas ("oi"),
 trivialidades ("ok", "?", "kkk") e comandos explícitos (``/ajuda``,
 ``/cancelar``). Essas mensagens recebem respostas pré-formatadas

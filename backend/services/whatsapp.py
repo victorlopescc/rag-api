@@ -53,7 +53,7 @@ Pra ver mais dicas, envie */ajuda*."""
 
 
 # Resposta a trivialidades / mensagens curtas sem sentido ("ok", "?", "kkk").
-# Não envia ao Ollama, devolve um nudge pro aluno mandar uma pergunta de fato.
+# Não envia à LLM, devolve um nudge pro aluno mandar uma pergunta de fato.
 TRIVIAL_REPLY = """Hmm, não entendi essa mensagem 🤔
 
 Tente mandar uma dúvida por escrito, por exemplo:

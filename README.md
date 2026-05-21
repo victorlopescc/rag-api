@@ -16,10 +16,10 @@ intermediar).
 ## Arquitetura
 
 ```
-        WhatsApp                                 ┌────────────┐
-           │                                     │   Ollama   │
-           ▼                                     │ (LLM local)│
-    ┌─────────────┐     ┌──────────┐             └──────┬─────┘
+        WhatsApp                                 ┌─────────────┐
+           │                                     │ Gemini API  │
+           ▼                                     │ (LLM + emb) │
+    ┌─────────────┐     ┌──────────┐             └──────┬──────┘
     │  Evolution  │◀───▶│ Mongo +  │                    │
     │    API      │     │  Redis   │             ┌──────▼─────┐
     └──────┬──────┘     └──────────┘             │  ChromaDB  │
@@ -39,23 +39,26 @@ intermediar).
 Frontend separado em [`rag-portal`](https://github.com/) — React 19 +
 Mantine 9, consome a API.
 
-Todos os serviços rodam localmente — nenhuma dependência paga.
+LLM e embeddings vão via [LiteLLM](https://github.com/BerriAI/litellm) —
+hoje configurado pra Gemini Flash, trocar de provider (Groq, OpenAI,
+Claude, OpenRouter, ...) é só mudar `LLM_MODEL` no `.env`.
 
 ---
 
 ## Componentes do retrieval
 
-1. **Busca densa** — embeddings `nomic-embed-text` (Ollama) indexados
-   no ChromaDB, distância de cosseno.
+1. **Busca densa** — embeddings `gemini-embedding-001` (Gemini, 768 dim
+   via Matryoshka shrinking) indexados no ChromaDB, distância de cosseno.
 2. **Busca lexical BM25** — `rank-bm25` em memória, reconstruído a
    cada ingestão.
 3. **Sobreposição lexical crua** — contagem de tokens distintos em
    comum, complementa BM25 em corpora pequenos onde o IDF satura.
 4. **Fusão por Reciprocal Rank Fusion (RRF)** — combina os rankings
    acima sem necessidade de calibrar pesos.
-5. **Reranker cross-encoder** — `mmarco-mMiniLMv2-L12-H384-v1` da
-   `sentence-transformers`, rodando em CPU; reordena os top-50 do RRF
-   e devolve os 10 melhores ao prompt.
+5. **Reranker LLM-as-judge** — usa o próprio Gemini 3 Flash pra avaliar
+   relevância dos top-30 do RRF e devolver os melhores ao prompt.
+   Substituiu o cross-encoder local mmarco — mais inteligente em formato
+   tabular, custo trivial (~$0.001/query).
 
 ---
 
@@ -65,11 +68,11 @@ Todos os serviços rodam localmente — nenhuma dependência paga.
 |---|---|---|
 | Docker + Docker Compose | 24+ | https://docs.docker.com/get-docker |
 | Python | 3.11+ | https://python.org |
-| Ollama | 0.1+ | https://ollama.ai |
+| Google AI Studio | — | https://aistudio.google.com/app/apikey |
 
-**Hardware recomendado:** 16 GB de RAM (Qwen2.5 7B Instruct ocupa
-~5 GB residentes durante a inferência; ChromaDB + Postgres + Mongo +
-Redis + Evolution + reranker somam mais ~3 GB).
+**Hardware recomendado:** 8 GB de RAM (ChromaDB + Postgres + Mongo +
+Redis + Evolution + reranker em CPU somam ~3 GB; a LLM roda em API
+externa). Não exige GPU.
 
 **Para expor o webhook do WhatsApp durante o desenvolvimento local**,
 use um túnel público (ngrok, cloudflared, etc.) apontando para
@@ -79,31 +82,34 @@ use um túnel público (ngrok, cloudflared, etc.) apontando para
 
 ## Setup local
 
-### 1. Suba a infra com Docker
+### 1. Pegue uma API key do Gemini
+
+1. Acesse [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Faça login com conta Google e clique em "Create API key"
+3. Copia a key (formato `AIza...`)
+
+O free tier cobre o uso normal de um piloto acadêmico com folga:
+1500 req/dia em chat e 1500 RPM em embeddings.
+
+### 2. Suba a infra com Docker
 
 ```bash
 cp infra/.env.example infra/.env
-# edite infra/.env preenchendo POSTGRES_PASSWORD, API_SECRET_KEY e
-# EVOLUTION_API_KEY com valores aleatórios fortes.
+# edite infra/.env preenchendo:
+#   GEMINI_API_KEY (do passo 1)
+#   POSTGRES_PASSWORD, API_SECRET_KEY, EVOLUTION_API_KEY (aleatórios fortes)
 
 docker compose -f infra/docker-compose.yml up -d
 ```
 
 Sobe PostgreSQL, MongoDB, Redis, ChromaDB e Evolution API.
 
-### 2. Crie o ambiente Python e instale deps
+### 3. Crie o ambiente Python e instale deps
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r backend/requirements.txt
-```
-
-### 3. Baixe os modelos do Ollama
-
-```bash
-ollama pull qwen2.5:7b-instruct-q4_K_M     # ~4.4 GB
-ollama pull nomic-embed-text               # ~270 MB
 ```
 
 ### 4. Suba o backend
@@ -117,6 +123,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ```bash
 curl http://localhost:8000/health
+python infra/validate_infra.py   # valida Docker + Postgres + Gemini
 ```
 
 ---
@@ -144,8 +151,9 @@ Veja `infra/.env.example` para a lista completa. As principais:
 
 | Variável | Descrição |
 |---|---|
-| `OLLAMA_LLM_MODEL` | Modelo do Ollama (default: `qwen2.5:7b-instruct-q4_K_M`) |
-| `OLLAMA_EMBED_MODEL` | Modelo de embedding (default: `nomic-embed-text`) |
+| `GEMINI_API_KEY` | API key do Google AI Studio |
+| `LLM_MODEL` | Modelo LLM via LiteLLM (default: `gemini/gemini-2.5-flash`) |
+| `EMBED_MODEL` | Modelo de embedding (default: `gemini/gemini-embedding-001`, 768 dim) |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | Parâmetros do chunker (500 / 80) |
 | `SIMILARITY_THRESHOLD` | Score mínimo no modo sem reranker (0.20) |
 | `MAX_CHUNKS_RETRIEVED` | Top-K final passado ao LLM (10) |
@@ -197,13 +205,13 @@ backend/
 │   ├── acronyms.py          # Expansão e detecção de siglas (ADA, TCC, PPC...)
 │   ├── bm25_index.py        # BM25 in-memory + sobreposição lexical crua
 │   ├── chunker.py           # Splitter recursivo por separadores
-│   ├── embedder.py          # Chamadas ao Ollama embeddings
+│   ├── embedder.py          # Embeddings via litellm (Gemini)
 │   ├── extractor.py         # PDF (PyMuPDF) + DOCX
 │   ├── ingestor.py          # Pipeline de ingestão completa
-│   ├── llm.py               # Cliente do Ollama generate
+│   ├── llm.py               # Geração de texto via litellm (Gemini)
 │   ├── prompt_builder.py    # Constrói o prompt final
 │   ├── reranker.py          # Cross-encoder mmarco-mMiniLMv2 (CPU)
-│   ├── retrieval_strategies.py  # 3 estratégias + RRF
+│   ├── retrieval.py         # Retrieval híbrido (denso + BM25 + RRF)
 │   └── vector_store.py      # Wrapper do ChromaDB
 ├── routers/
 │   ├── admin.py             # Escalações + thread + manutenção

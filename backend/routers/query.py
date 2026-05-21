@@ -41,7 +41,7 @@ def query_rag(req: QueryRequest, db: Session = Depends(get_db)):
         question=req.question,
         answer=result.answer,
         chunks_used=chunk_ids,
-        model_used=settings.ollama_llm_model,
+        model_used=settings.llm_model,
         latency_ms=result.latency_ms,
         was_fallback=result.was_fallback,
     )
