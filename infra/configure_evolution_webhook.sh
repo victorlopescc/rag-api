@@ -7,16 +7,17 @@
 #   CONTACTS_UPSERT  — contatos novos (resolução de LID)
 #   CONTACTS_UPDATE  — atualização de contatos (LID)
 #
-# Quando você troca a URL do ngrok ou recria a instância, rode esse script.
+# Quando você troca a URL pública (ou recria a instância), rode esse script.
 #
 # Variáveis necessárias (lidas do infra/.env, ou exporta no shell):
 #   EVOLUTION_API_URL        (default http://localhost:8080)
 #   EVOLUTION_API_KEY        (sem default — obrigatório)
 #   EVOLUTION_INSTANCE       (default 'coordenacao')
-#   WEBHOOK_URL              (URL pública do backend, ex: https://xxx.ngrok-free.app/webhook)
+#   WEBHOOK_URL              (URL pública do backend; pode ser fixa via
+#                             Cloudflare Tunnel — ex: https://bot.vlopinhos.dev/webhook)
 #
 # Uso:
-#   bash infra/configure_evolution_webhook.sh https://abcd-12345.ngrok-free.app/webhook
+#   bash infra/configure_evolution_webhook.sh https://bot.vlopinhos.dev/webhook
 # =============================================================================
 set -euo pipefail
 
