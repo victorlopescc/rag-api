@@ -56,6 +56,16 @@ class Student(Base):
     matricula = Column(String, nullable=False)
     phone_number = Column(String, nullable=False, unique=True)
     pending_welcome_id = Column(String, nullable=True, index=True)
+    # Token curto (6 chars) gerado no cadastro web. O aluno é instruído a
+    # enviar uma mensagem pré-formatada com ``código: <token>`` via link
+    # ``wa.me``; o webhook detecta o token, casa com este Student e dispara
+    # a mensagem de boas-vindas como RESPOSTA (evita o "spam" detectado
+    # pela Meta quando o bot inicia conversa proativamente).
+    # NULL quando o cadastro já foi completado.
+    registration_token = Column(String, nullable=True, unique=True, index=True)
+    # Marca quando o aluno enviou a primeira mensagem via link wa.me.
+    # NULL = cadastrado mas ainda não interagiu pelo WhatsApp.
+    registration_completed_at = Column(DateTime(timezone=True), nullable=True)
     active = Column(Boolean, default=True)
     data_consent = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)

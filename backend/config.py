@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     evolution_api_key: str = "evolution_key_troque"
     evolution_instance: str = "coordenacao"
 
+    # Número do WhatsApp do bot, sem +, com DDI. Usado pra montar o link
+    # ``wa.me/<numero>?text=...`` no fluxo de cadastro "aluno inicia a
+    # conversa" — necessário pra não cair na detecção de spam do Meta
+    # quando o bot envia mensagem proativamente. Ex: 5531990899055.
+    bot_phone_number: str = ""
+
     # Mongo da Evolution API (usado para resolver LID via ACKs de entrega)
     evolution_mongo_uri: str = "mongodb://localhost:27017"
     evolution_mongo_db: str = "evolution-whatsapp-api"

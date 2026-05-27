@@ -5,7 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from config import settings
-from database import QueryLog, QASession, Student, get_db
+from database import QueryLog, QASession, Student, get_db, utcnow
 from rag_engine import ask
 from services.dedup import message_dedup
 from services.evolution_client import evolution_client
@@ -22,6 +22,9 @@ from services.whatsapp import (
     THANKS_REPLY,
     THREAD_CLOSED_BY_STUDENT_NOTICE,
     TRIVIAL_REPLY,
+    build_welcome_text,
+    extract_registration_token,
+    normalize_lid,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +135,94 @@ def _find_student(remote_jid: str, db: Session) -> Student | None:
         return resolve_student_by_lid(remote_jid, db)
     phone = remote_jid.split("@", 1)[0]
     return db.query(Student).filter(Student.phone_number == phone).first()
+
+
+def _phone_from_remote_jid(remote_jid: str) -> str:
+    """Extrai o número (sem ``@dominio``) de um ``remoteJid``. Se for
+    ``@lid``, devolve o próprio JID — o evolution_client lida com isso."""
+    if not remote_jid:
+        return ""
+    return remote_jid.split("@", 1)[0]
+
+
+async def _try_activate_registration(
+    db: Session,
+    token: str,
+    msg: dict,
+    *,
+    existing_student: Student | None,
+) -> dict | None:
+    """Tenta ativar um cadastro pendente usando o ``token`` extraído da
+    mensagem. Retorna o dict de resposta do webhook se a ativação foi
+    feita (ou identificada como repetida), ou ``None`` quando o token
+    não casa com nenhum cadastro — caller decide o que fazer.
+
+    Vincula ``phone_number`` e ``lid`` ao Student a partir dos dados da
+    mensagem recebida, completando os campos que o cadastro web não
+    podia conhecer (especialmente o LID, que só aparece depois da 1ª
+    interação real do WhatsApp).
+    """
+    pending = (
+        db.query(Student)
+        .filter(Student.registration_token == token)
+        .first()
+    )
+    if pending is None:
+        logger.info(f"Token '{token}' não casou com nenhum cadastro pendente.")
+        return None
+
+    # Se já foi ativado antes, NÃO reenviamos welcome — o aluno
+    # provavelmente clicou no link de novo por engano. Caímos pra
+    # triagem normal.
+    if pending.registration_completed_at is not None:
+        logger.info(
+            f"Token '{token}' já ativado (aluno {pending.id}); ignorando."
+        )
+        return None
+
+    # Se já existe OUTRO Student vinculado ao mesmo phone/LID (existing),
+    # priorizamos o cadastro pendente: atualizamos os vínculos e
+    # marcamos o duplicado como inativo. Isso é raro — só ocorre se o
+    # aluno cadastrou de novo após já ter usado o bot antes.
+    if existing_student and existing_student.id != pending.id:
+        logger.warning(
+            f"Token '{token}' apontou pra Student {pending.id}, mas o JID "
+            f"já estava vinculado a Student {existing_student.id}. "
+            f"Desvinculando antigo e ativando o novo."
+        )
+        existing_student.phone_number = f"_old_{existing_student.id}"
+        existing_student.lid = None
+        existing_student.active = False
+        db.flush()
+
+    remote_jid = msg["remote_jid"]
+    if "@lid" in remote_jid:
+        pending.lid = normalize_lid(remote_jid)
+    else:
+        # remoteJid no formato 5511...@s.whatsapp.net — atualiza o phone
+        # caso o aluno tenha digitado errado no formulário.
+        pending.phone_number = _phone_from_remote_jid(remote_jid)
+
+    pending.registration_completed_at = utcnow()
+    pending.registration_token = None  # token "consumido"
+    pending.active = True
+    db.commit()
+    db.refresh(pending)
+
+    logger.info(
+        f"Cadastro ativado: aluno {pending.id} ({pending.full_name}) "
+        f"via token '{token}' (JID: {remote_jid})"
+    )
+
+    # Manda welcome como REPLY (Meta OK). Usamos o phone_number
+    # atualizado se houver, senão o LID como destino.
+    target = pending.phone_number if pending.phone_number and not pending.phone_number.startswith("_old_") else remote_jid
+    try:
+        await evolution_client.send_text(target, build_welcome_text(pending.full_name))
+    except Exception as e:
+        logger.error(f"Erro enviando welcome após ativação: {e}")
+
+    return {"status": "registration_activated", "student_id": str(pending.id)}
 
 
 def _log_query(db: Session, student: Student, question: str, result) -> None:
@@ -265,11 +356,43 @@ async def handle_messages_upsert(body: dict, db: Session) -> dict:
     logger.info(f"Mensagem de {msg['push_name']} ({msg['remote_jid']}): {msg['text'][:60]}")
 
     student = _find_student(msg["remote_jid"], db)
+
+    # FLUXO DE ATIVAÇÃO DE CADASTRO (wa.me link)
+    # ------------------------------------------------------------------
+    # No fluxo novo, o BOT NÃO envia mais boas-vindas proativamente
+    # (Meta detectava como spam). O aluno se cadastra no site, recebe
+    # um link ``wa.me/<bot>?text=...código: ABC123`` e envia a primeira
+    # mensagem ele mesmo. Aqui detectamos o token, casamos com o
+    # Student correspondente e disparamos o welcome como RESPOSTA.
+    #
+    # IMPORTANTE: rodamos isso ANTES de barrar por ``unknown_sender``,
+    # porque na 1ª mensagem o LID/phone podem não estar vinculados a
+    # nenhum Student ainda.
+    token = extract_registration_token(msg["text"])
+    if token:
+        result = await _try_activate_registration(
+            db, token, msg, existing_student=student,
+        )
+        if result is not None:
+            return result
+        # Token presente mas não casou com nenhum cadastro pendente —
+        # cai pro tratamento abaixo. Se o student existir (mensagem
+        # legítima de aluno já ativo), seguimos pra triagem normal.
+
     if not student:
         logger.warning(
             f"Mensagem de {msg['remote_jid']} sem aluno vinculado — "
             f"usuário precisa se cadastrar primeiro."
         )
+        try:
+            await evolution_client.send_text(
+                _phone_from_remote_jid(msg["remote_jid"]),
+                "Olá! Não consegui identificar seu cadastro. Para usar o bot "
+                "da coordenação, faça o cadastro em bot.vlopinhos.dev e siga "
+                "as instruções pra iniciar a conversa.",
+            )
+        except Exception as e:
+            logger.error(f"Erro avisando unknown_sender: {e}")
         return {"status": "unknown_sender"}
 
     # 1.5. Voto por TEXTO. O aluno respondeu "1"/"2"/"3" depois de receber

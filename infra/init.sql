@@ -34,16 +34,22 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 -- Alunos cadastrados que usam o bot via WhatsApp
 CREATE TABLE IF NOT EXISTS students (
-    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    lid                 TEXT,                          -- LID do WhatsApp (vinculado após o 1º ACK)
-    full_name           TEXT NOT NULL,
-    matricula           TEXT NOT NULL,
-    phone_number        TEXT NOT NULL UNIQUE,
-    pending_welcome_id  TEXT,                          -- key.id da mensagem de boas-vindas (usado p/ resolver LID)
-    active              BOOLEAN NOT NULL DEFAULT TRUE,
-    data_consent        BOOLEAN NOT NULL DEFAULT TRUE, -- opt-in para uso dos dados no TCC
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    lid                         TEXT,                          -- LID do WhatsApp (vinculado após o 1º ACK)
+    full_name                   TEXT NOT NULL,
+    matricula                   TEXT NOT NULL,
+    phone_number                TEXT NOT NULL UNIQUE,
+    pending_welcome_id          TEXT,                          -- key.id da mensagem de boas-vindas (usado p/ resolver LID)
+    -- Token curto gerado no cadastro web. Aluno envia mensagem com
+    -- "código: <token>" via wa.me, e o webhook casa por aqui pra
+    -- completar o cadastro. NULL após o cadastro ser confirmado.
+    registration_token          TEXT UNIQUE,
+    -- Marca quando o aluno enviou a primeira mensagem via wa.me.
+    registration_completed_at   TIMESTAMPTZ,
+    active                      BOOLEAN NOT NULL DEFAULT TRUE,
+    data_consent                BOOLEAN NOT NULL DEFAULT TRUE, -- opt-in para uso dos dados no TCC
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Log de perguntas feitas via WhatsApp (auditoria)
@@ -141,8 +147,10 @@ CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_query_logs_phone   ON query_logs(phone_number);
 CREATE INDEX IF NOT EXISTS idx_query_logs_date    ON query_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_students_lid       ON students(lid);
-CREATE INDEX IF NOT EXISTS idx_students_pending   ON students(pending_welcome_id);
+CREATE INDEX IF NOT EXISTS idx_students_lid           ON students(lid);
+CREATE INDEX IF NOT EXISTS idx_students_pending       ON students(pending_welcome_id);
+CREATE INDEX IF NOT EXISTS idx_students_reg_token     ON students(registration_token)
+    WHERE registration_token IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_qa_sessions_student     ON qa_sessions(student_id);
 CREATE INDEX IF NOT EXISTS idx_qa_sessions_status      ON qa_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_qa_sessions_open_only   ON qa_sessions(student_id) WHERE status = 'open';
